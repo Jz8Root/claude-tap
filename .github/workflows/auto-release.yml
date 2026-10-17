@@ -135,8 +135,9 @@ jobs:
           case "$merge_state" in
             CLEAN|HAS_HOOKS) ;;
             *)
+              gh pr merge "$pr_number" --auto --match-head-commit "$release_commit" --squash --delete-branch
               echo "::notice::Release PR #${pr_number} awaits maintainer review (${merge_state})"
-              echo "Release PR #${pr_number} awaits maintainer review (${merge_state})." >> "$GITHUB_STEP_SUMMARY"
+              echo "Auto-merge enabled for release PR #${pr_number}; awaits maintainer review (${merge_state})." >> "$GITHUB_STEP_SUMMARY"
               exit 0
               ;;
           esac

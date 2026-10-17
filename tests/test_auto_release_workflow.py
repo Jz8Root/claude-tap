@@ -83,10 +83,15 @@ def test_release_merge_guard_waits_for_review_without_bypassing_rules(tmp_path, 
     )
     assert result.returncode == 0, result.stderr
     assert output.read_text() == "changed=true\n"
+    args = json.loads(merge_args.read_text())
+    expected = ["pr", "merge", "442"]
+    if state != "CLEAN":
+        expected.append("--auto")
+    expected.extend(["--match-head-commit", "reviewed-sha", "--squash", "--delete-branch"])
+    assert args == expected
     if state == "CLEAN":
-        args = json.loads(merge_args.read_text())
-        assert args == ["pr", "merge", "442", "--match-head-commit", "reviewed-sha", "--squash", "--delete-branch"]
+        assert not summary.exists()
     else:
-        assert not merge_args.exists()
+        assert "Auto-merge enabled" in summary.read_text()
         assert "awaits maintainer review" in summary.read_text()
         assert "::notice::" in result.stdout
