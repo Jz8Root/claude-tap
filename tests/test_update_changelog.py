@@ -1,54 +1,83 @@
-#!/usr/bin/env python3
-"""Unit tests for scripts/update_changelog.py."""
+"""Exercise release-note promotion through the real filesystem CLI."""
 
 from __future__ import annotations
 
-import datetime as dt
-import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "update_changelog.py"
-MODULE_NAME = "update_changelog"
 
 
-def _load_module():
-    spec = importlib.util.spec_from_file_location(MODULE_NAME, SCRIPT_PATH)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[MODULE_NAME] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_render_release_section_uses_commit_subjects() -> None:
-    module = _load_module()
-
-    section = module.render_release_section(
-        "0.1.40",
-        dt.date(2026, 5, 3),
-        ["fix: derive release versions from git tags", "docs: update changelog"],
+def run_generator(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--repo-root", str(root), "--version", "0.1.146", "--date", "2026-10-17"],
+        capture_output=True,
+        text=True,
     )
 
-    assert "## [0.1.40] - 2026-05-03" in section
-    assert "- fix: derive release versions from git tags" in section
-    assert "- docs: update changelog" in section
+
+def test_promotes_curated_bilingual_notes_once_without_duplicating_history(tmp_path) -> None:
+    notes = ["### Fixed\n\n- Preserve stdout.\n", "### Fixed\n\n- Translated stdout fix.\n"]
+    paths = [tmp_path / "CHANGELOG.md", tmp_path / "CHANGELOG.zh.md"]
+    histories = []
+    for path, body in zip(paths, notes):
+        history = "## [0.1.145] - 2026-08-16\n\n- Previous release.\n"
+        histories.append(history)
+        path.write_text("# Changelog\n\n## [Unreleased]\n\n" + body + "\n" + history)
+    result = run_generator(tmp_path)
+    assert result.returncode == 0, result.stderr
+    snapshots = []
+    for path, body, history in zip(paths, notes, histories):
+        updated = path.read_text()
+        assert updated.startswith("# Changelog\n\n## [Unreleased]\n\n## [0.1.146] - 2026-10-17\n")
+        assert updated.count(body.strip()) == 1
+        assert updated.endswith(history)
+        snapshots.append(updated)
+    assert run_generator(tmp_path).returncode == 0
+    assert [path.read_text() for path in paths] == snapshots
 
 
-def test_render_release_section_handles_empty_subjects() -> None:
-    module = _load_module()
+def test_empty_notes_produce_maintenance_release_without_git_subjects(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    path = tmp_path / "CHANGELOG.md"
+    path.write_text("# Changelog\n\n## [Unreleased]\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "chore(evidence): retake screenshots",
+        ],
+        check=True,
+    )
+    assert run_generator(tmp_path).returncode == 0
+    assert "Maintenance release." in path.read_text()
+    assert "retake screenshots" not in path.read_text()
 
-    section = module.render_release_section("0.1.40", dt.date(2026, 5, 3), [])
 
-    assert "- Maintenance release." in section
-
-
-def test_insert_release_section_after_unreleased() -> None:
-    module = _load_module()
-    changelog = "# Changelog\n\n## [Unreleased]\n\n## [0.1.39] - 2026-05-02\n"
-
-    updated = module.insert_release_section(changelog, "## [0.1.40] - 2026-05-03\n\n### Changed\n- test\n")
-
-    assert updated.index("## [Unreleased]") < updated.index("## [0.1.40]")
-    assert updated.index("## [0.1.40]") < updated.index("## [0.1.39]")
+@pytest.mark.parametrize("failure", ["missing_heading", "untranslated_notes", "partial_version"])
+def test_invalid_bilingual_inputs_do_not_partially_write_files(tmp_path, failure: str) -> None:
+    english = "# Changelog\n\n## [Unreleased]\n\n- Public fix.\n"
+    chinese = english
+    if failure == "missing_heading":
+        chinese = "# Changelog\n"
+    elif failure == "untranslated_notes":
+        chinese = "# Changelog\n\n## [Unreleased]\n"
+    else:
+        english += "\n## [0.1.146] - 2026-10-17\n\n- Released.\n"
+    paths = [tmp_path / "CHANGELOG.md", tmp_path / "CHANGELOG.zh.md"]
+    for path, text in zip(paths, [english, chinese]):
+        path.write_text(text)
+    result = run_generator(tmp_path)
+    assert result.returncode != 0
+    assert [path.read_text() for path in paths] == [english, chinese]

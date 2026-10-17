@@ -6,66 +6,36 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
-import subprocess
 from pathlib import Path
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 UNRELEASED_RE = re.compile(r"^## \[Unreleased\]\s*$", re.MULTILINE)
 RELEASE_HEADING_RE = re.compile(r"^## \[(?P<version>\d+\.\d+\.\d+)\](?:\s+-\s+\d{4}-\d{2}-\d{2})?\s*$", re.MULTILINE)
-SKIP_SUBJECT_PREFIXES = (
-    "chore: bump version",
-    "chore: update changelog",
-)
-
-
-def _git(repo_root: Path, args: list[str]) -> str:
-    return subprocess.check_output(["git", *args], cwd=repo_root, text=True, stderr=subprocess.DEVNULL).strip()
 
 
 def changelog_has_version(text: str, version: str) -> bool:
     return any(match.group("version") == version for match in RELEASE_HEADING_RE.finditer(text))
 
 
-def previous_release_tag(repo_root: Path) -> str | None:
-    try:
-        tags = _git(repo_root, ["tag", "--list", "v[0-9]*", "--sort=-v:refname"])
-    except subprocess.CalledProcessError:
-        return None
-    return next((tag for tag in tags.splitlines() if tag), None)
+def unreleased_notes(changelog: str) -> str:
+    match = UNRELEASED_RE.search(changelog)
+    if not match:
+        raise ValueError("Changelog is missing '## [Unreleased]' section")
+    following = RELEASE_HEADING_RE.search(changelog, match.end())
+    return changelog[match.end() : following.start() if following else len(changelog)].strip()
 
 
-def release_subjects(repo_root: Path, previous_tag: str | None) -> list[str]:
-    rev_range = f"{previous_tag}..HEAD" if previous_tag else "HEAD"
-    try:
-        raw = _git(repo_root, ["log", "--reverse", "--pretty=format:%s", rev_range])
-    except subprocess.CalledProcessError:
-        return []
-
-    subjects: list[str] = []
-    for line in raw.splitlines():
-        subject = line.strip()
-        if not subject:
-            continue
-        if subject.startswith(SKIP_SUBJECT_PREFIXES):
-            continue
-        if "[skip release]" in subject:
-            continue
-        subjects.append(subject)
-    return subjects
-
-
-def render_release_section(version: str, release_date: dt.date, subjects: list[str]) -> str:
-    notes = subjects or ["Maintenance release."]
-    bullets = "\n".join(f"- {subject}" for subject in notes)
-    return f"## [{version}] - {release_date.isoformat()}\n\n### Changed\n{bullets}\n\n"
+def render_release_section(version: str, release_date: dt.date, notes: str) -> str:
+    return f"## [{version}] - {release_date.isoformat()}\n\n{notes.strip()}\n\n"
 
 
 def insert_release_section(changelog: str, section: str) -> str:
     match = UNRELEASED_RE.search(changelog)
     if not match:
-        raise ValueError("CHANGELOG.md is missing '## [Unreleased]' section")
-    insert_at = match.end()
-    return changelog[:insert_at] + "\n\n" + section.rstrip() + changelog[insert_at:]
+        raise ValueError("Changelog is missing '## [Unreleased]' section")
+    following = RELEASE_HEADING_RE.search(changelog, match.end())
+    history = changelog[following.start() :] if following else ""
+    return changelog[: match.end()].rstrip() + "\n\n" + section.rstrip() + "\n\n" + history
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,18 +52,28 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"Invalid version: {args.version}")
     release_date = dt.date.fromisoformat(args.date)
     repo_root = args.repo_root.resolve()
-    changelog_path = repo_root / "CHANGELOG.md"
-    changelog = changelog_path.read_text(encoding="utf-8")
-
-    if changelog_has_version(changelog, args.version):
-        print(f"CHANGELOG.md already has [{args.version}]")
+    paths = [repo_root / "CHANGELOG.md"]
+    translated_path = repo_root / "CHANGELOG.zh.md"
+    if translated_path.exists():
+        paths.append(translated_path)
+    documents = [(path, path.read_text(encoding="utf-8")) for path in paths]
+    pending = [(path, text) for path, text in documents if not changelog_has_version(text, args.version)]
+    if not pending:
+        print(f"Changelogs already have [{args.version}]")
         return 0
-
-    previous_tag = previous_release_tag(repo_root)
-    subjects = release_subjects(repo_root, previous_tag)
-    section = render_release_section(args.version, release_date, subjects)
-    changelog_path.write_text(insert_release_section(changelog, section), encoding="utf-8")
-    print(f"Inserted CHANGELOG.md section for [{args.version}]")
+    if len(pending) != len(documents):
+        raise SystemExit("Release version must be present in both changelogs or neither")
+    notes = [unreleased_notes(text) for _, text in pending]
+    if any(notes) and not all(notes):
+        raise SystemExit("Add matching Unreleased notes to both changelogs before releasing")
+    defaults = ["### Changed\n\n- Maintenance release.", "### 变更\n\n- 维护版本。"]
+    updates = [
+        (path, insert_release_section(text, render_release_section(args.version, release_date, body or fallback)))
+        for (path, text), body, fallback in zip(pending, notes, defaults)
+    ]
+    for path, updated in updates:
+        path.write_text(updated, encoding="utf-8")
+        print(f"Promoted {path.name} Unreleased notes to [{args.version}]")
     return 0
 
 
