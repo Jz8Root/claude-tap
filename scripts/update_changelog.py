@@ -52,10 +52,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"Invalid version: {args.version}")
     release_date = dt.date.fromisoformat(args.date)
     repo_root = args.repo_root.resolve()
-    paths = [repo_root / "CHANGELOG.md"]
-    translated_path = repo_root / "CHANGELOG.zh.md"
-    if translated_path.exists():
-        paths.append(translated_path)
+    paths = [repo_root / "CHANGELOG.md", repo_root / "CHANGELOG.zh.md"]
+    for path in paths:
+        if not path.is_file():
+            raise SystemExit(f"Required changelog is missing: {path.name}")
     documents = [(path, path.read_text(encoding="utf-8")) for path in paths]
     pending = [(path, text) for path, text in documents if not changelog_has_version(text, args.version)]
     if not pending:
@@ -66,11 +66,13 @@ def main(argv: list[str] | None = None) -> int:
     notes = [unreleased_notes(text) for _, text in pending]
     if any(notes) and not all(notes):
         raise SystemExit("Add matching Unreleased notes to both changelogs before releasing")
-    defaults = ["### Changed\n\n- Maintenance release.", "### 变更\n\n- 维护版本。"]
-    updates = [
-        (path, insert_release_section(text, render_release_section(args.version, release_date, body or fallback)))
-        for (path, text), body, fallback in zip(pending, notes, defaults)
-    ]
+    template_root = Path(__file__).resolve().parent.parent / ".agents" / "templates"
+    updates = []
+    for (path, text), body, suffix in zip(pending, notes, ["", ".zh"]):
+        if not body:
+            body = (template_root / f"maintenance-release{suffix}.md").read_text(encoding="utf-8")
+        section = render_release_section(args.version, release_date, body)
+        updates.append((path, insert_release_section(text, section)))
     for path, updated in updates:
         path.write_text(updated, encoding="utf-8")
         print(f"Promoted {path.name} Unreleased notes to [{args.version}]")

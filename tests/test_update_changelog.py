@@ -44,6 +44,8 @@ def test_empty_notes_produce_maintenance_release_without_git_subjects(tmp_path) 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     path = tmp_path / "CHANGELOG.md"
     path.write_text("# Changelog\n\n## [Unreleased]\n")
+    translated_path = tmp_path / "CHANGELOG.zh.md"
+    translated_path.write_text("# Changelog\n\n## [Unreleased]\n")
     subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
     subprocess.run(
         [
@@ -63,6 +65,28 @@ def test_empty_notes_produce_maintenance_release_without_git_subjects(tmp_path) 
     assert run_generator(tmp_path).returncode == 0
     assert "Maintenance release." in path.read_text()
     assert "retake screenshots" not in path.read_text()
+    template_root = SCRIPT_PATH.parent.parent / ".agents" / "templates"
+    translated_note = (template_root / "maintenance-release.zh.md").read_text().strip()
+    assert translated_note in translated_path.read_text()
+    assert "retake screenshots" not in translated_path.read_text()
+
+
+@pytest.mark.parametrize("missing_name", ["CHANGELOG.md", "CHANGELOG.zh.md"])
+@pytest.mark.parametrize("already_released", [False, True])
+def test_missing_changelog_fails_without_writing_the_other_file(
+    tmp_path, missing_name: str, already_released: bool
+) -> None:
+    present_name = "CHANGELOG.zh.md" if missing_name == "CHANGELOG.md" else "CHANGELOG.md"
+    present = tmp_path / present_name
+    original = "# Changelog\n\n## [Unreleased]\n\n- Public fix.\n"
+    if already_released:
+        original += "\n## [0.1.146] - 2026-10-17\n\n- Released.\n"
+    present.write_text(original)
+    result = run_generator(tmp_path)
+    assert result.returncode != 0
+    assert f"Required changelog is missing: {missing_name}" in result.stderr
+    assert present.read_text() == original
+    assert not (tmp_path / missing_name).exists()
 
 
 @pytest.mark.parametrize("failure", ["missing_heading", "untranslated_notes", "partial_version"])
