@@ -1,5 +1,7 @@
 # Changelog
 
+[简体中文](CHANGELOG.zh.md)
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -7,34 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Compute viewer costs using the Python pricing adapter.
+- Explain prompt cache misses in the viewer turn detail.
+- Distinguish harness-injected input from human prompts when displaying conversation titles.
+- Flag tool results large enough to dominate a conversation turn.
+
 ### Fixed
 
 - Fix Dashboard records and HTML viewer HTTP 500 errors caused by `urlsplit()` `ValueError`, hiding the affected display strings and response text previews while retaining stored captures.
-
 - Ignore object key order in viewer parameter diffs and sort displayed JSON to highlight actual value changes.
-
-- Preserve wrapped-client stdout for every mode by always routing claude-tap operational output to stderr.
-- fix(dsh): also capture Anthropic-protocol requests (`/v1/messages`) so trace sessions are not empty when dsh is configured with an Anthropic provider.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- Preserve wrapped-client stdout for every mode by routing claude-tap operational output to stderr.
+- Capture Anthropic-protocol requests (`/v1/messages`) when dsh uses an Anthropic provider.
+- Avoid double-counting cached input tokens in dashboard session totals.
 
 ## [0.1.145] - 2026-08-16
 

@@ -53,7 +53,7 @@ jobs:
           tag="${{ steps.version.outputs.tag }}"
           version="${tag#v}"
           python scripts/update_changelog.py --version "$version"
-          if git diff --quiet CHANGELOG.md; then
+          if git diff --quiet -- CHANGELOG.md CHANGELOG.zh.md; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -63,7 +63,7 @@ jobs:
           cat > "$pr_body_file" <<EOF
           ## Summary
 
-          - Update CHANGELOG.md for ${tag}.
+          - Promote the English and Simplified Chinese release notes for ${tag}.
           - Continue the automated release after changelog bookkeeping.
 
           ## Validation
@@ -79,7 +79,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add CHANGELOG.md
+          git add CHANGELOG.md CHANGELOG.zh.md
           git commit -m "chore: update changelog for $tag"
           release_commit="$(git rev-parse HEAD)"
 
@@ -130,8 +130,18 @@ jobs:
           fi
 
           gh pr checks "$pr_number" --watch --fail-fast --interval 10
-          gh pr merge "$pr_number" --admin --squash --delete-branch
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          merge_state="$(gh pr view "$pr_number" --json mergeStateStatus --jq '.mergeStateStatus')"
+          case "$merge_state" in
+            CLEAN|HAS_HOOKS) ;;
+            *)
+              gh pr merge "$pr_number" --auto --match-head-commit "$release_commit" --squash --delete-branch
+              echo "::notice::Release PR #${pr_number} awaits maintainer review (${merge_state})"
+              echo "Auto-merge enabled for release PR #${pr_number}; awaits maintainer review (${merge_state})." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+          esac
+          gh pr merge "$pr_number" --match-head-commit "$release_commit" --squash --delete-branch
 
       - name: Create and push tag
         if: steps.changelog.outputs.changed == 'false'
