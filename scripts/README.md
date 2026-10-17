@@ -1,5 +1,7 @@
 # Scripts
 
+[简体中文](README.zh.md)
+
 ## `check_coverage.py`
 
 Enforce project and incremental coverage targets for backend Python code and the
@@ -105,9 +107,9 @@ python scripts/check_changelog.py --tag v0.1.40
 
 ## `update_changelog.py`
 
-Insert a release section in `CHANGELOG.md` when one is missing.
+Promote curated `## [Unreleased]` notes into matching release sections in `CHANGELOG.md` and `CHANGELOG.zh.md`. Add matching notes to both files before releasing; the generator validates both documents before writing either one. It preserves older releases and does not copy git commit subjects into the public notes.
 
-Auto-release uses this before tagging so normal feature/fix PRs are not blocked by changelog bookkeeping. If the main branch is protected, auto-release opens or updates a changelog PR with the standard PR body, waits for the PR checks, merges it with the release bot's admin bypass, and publishes after that PR is merged.
+Auto-release runs this before tagging. It opens or updates a changelog PR, waits for its checks, and merges the checked head when repository requirements are satisfied. If review is still required, it enables auto-merge and reports the pending review. Maintainers must review the PR and resolve addressed discussions; the workflow does not use an admin bypass. Publishing continues after the changelog PR merges.
 
 ### Usage
 
