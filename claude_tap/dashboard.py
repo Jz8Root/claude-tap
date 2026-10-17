@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,25 @@ _SENSITIVE_KEY_NAMES = {
 }
 _FORM_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-\[\]]{1,128}$")
 _MAX_TEXT_REDACTION_DEPTH = 8
+_dashboard_url_failures: ContextVar[list[bool] | None] = ContextVar("dashboard_url_failures", default=None)
+
+
+@contextmanager
+def dashboard_redaction_scope():
+    """Keep URL recovery local to one displayed session or metadata response."""
+    failures: list[bool] = []
+    token = _dashboard_url_failures.set(failures)
+    try:
+        yield failures
+    finally:
+        _dashboard_url_failures.reset(token)
+
+
+def hide_dashboard_previews(summary: dict[str, Any], fields=("first_user", "last_response", "error")) -> None:
+    """Hide response previews when their full source cannot be identified safely."""
+    for field in fields:
+        if summary.get(field):
+            summary[field] = _REDACTED_VALUE
 
 
 def read_dashboard_template() -> str:
@@ -110,14 +131,17 @@ def list_trace_sessions(
 
     sessions: list[dict[str, Any]] = []
     for row in rows:
-        try:
-            summary = _session_summary_from_row(
-                store,
-                row,
-                repair_stale_summary=repair_stale_summaries,
-            )
-        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError):
-            summary = _minimal_session_summary_from_row(row)
+        with dashboard_redaction_scope() as failures:
+            try:
+                summary = _session_summary_from_row(
+                    store,
+                    row,
+                    repair_stale_summary=repair_stale_summaries,
+                )
+            except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError):
+                summary = _minimal_session_summary_from_row(row)
+            if failures:
+                hide_dashboard_previews(summary)
         sessions.append(
             _apply_current_session_state(
                 summary,
@@ -199,17 +223,20 @@ def load_trace_session(
     row = store.load_session_row(session_id)
     if row is None:
         return None
-    summary = _apply_current_session_state(
-        _session_summary_from_row(store, row, allow_record_scan=False),
-        current_session_id,
-        live_record_count=(
-            live_record_count
-            if live_record_count is not None and current_session_id and row["id"] == current_session_id
-            else None
-        ),
-    )
-    summary = redact_dashboard_summary(summary)
-    records = redact_dashboard_records(store.load_records(session_id, limit=record_limit, offset=record_offset))
+    with dashboard_redaction_scope() as failures:
+        summary = _apply_current_session_state(
+            _session_summary_from_row(store, row, allow_record_scan=False),
+            current_session_id,
+            live_record_count=(
+                live_record_count
+                if live_record_count is not None and current_session_id and row["id"] == current_session_id
+                else None
+            ),
+        )
+        summary = redact_dashboard_summary(summary)
+        records = redact_dashboard_records(store.load_records(session_id, limit=record_limit, offset=record_offset))
+        if failures:
+            hide_dashboard_previews(summary)
     return {"session": summary, "records": records}
 
 
@@ -373,6 +400,8 @@ def _session_summary_from_row(
     allow_record_scan: bool = False,
     repair_stale_summary: bool = True,
 ) -> dict[str, Any]:
+    failures = _dashboard_url_failures.get()
+    failure_count = len(failures) if failures is not None else 0
     summary_json = row["summary_json"]
     if summary_json:
         try:
@@ -389,7 +418,8 @@ def _session_summary_from_row(
                 boundary_records = store.load_boundary_records(row["id"])
                 if boundary_records:
                     summary = _summary_from_boundary_records(row, boundary_records, cached)
-                    store.store_summary(row["id"], summary)
+                    if failures is None or len(failures) == failure_count:
+                        store.store_summary(row["id"], summary)
                     return summary
             return _normalize_cached_session_summary(row, cached)
 
@@ -413,7 +443,8 @@ def _session_summary_from_row(
         )
         summary["active"] = row["status"] == "active"
         if row["status"] != "active":
-            store.store_summary(row["id"], summary)
+            if failures is None or len(failures) == failure_count:
+                store.store_summary(row["id"], summary)
         return redact_dashboard_summary(summary)
 
     if not allow_record_scan:
@@ -432,7 +463,8 @@ def _session_summary_from_row(
                     is_current=False,
                     record_count=record_count,
                 )
-                store.store_summary(row["id"], summary)
+                if failures is None or len(failures) == failure_count:
+                    store.store_summary(row["id"], summary)
                 return summary
         return _minimal_session_summary_from_row(row)
 
@@ -451,7 +483,8 @@ def _session_summary_from_row(
     )
     summary["active"] = row["status"] == "active"
     if row["status"] != "active":
-        store.store_summary(row["id"], summary)
+        if failures is None or len(failures) == failure_count:
+            store.store_summary(row["id"], summary)
     return redact_dashboard_summary(summary)
 
 
@@ -955,7 +988,14 @@ def _redact_sensitive_text(value: str, depth: int = 0) -> str:
 def _redact_url_query(value: str, depth: int = 0) -> str | None:
     if "?" not in value:
         return None
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        failures = _dashboard_url_failures.get()
+        if failures is None:
+            raise
+        failures.append(True)
+        return _REDACTED_VALUE
     if not parsed.query or not _looks_like_url_or_path(value, parsed.path):
         return None
     redacted_query = _redact_query_string(parsed.query, depth)

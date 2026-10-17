@@ -614,6 +614,8 @@ claude-tap --tap-no-launch --tap-port 8080
 claude-tap --tap-no-open
 ```
 
+If `urlsplit()` raises `ValueError` while rendering a Dashboard session, the affected string and that response's text previews are shown as `REDACTED`. Existing recognition and nesting limits still apply. JSONL, compact, and HTML downloads preserve the stored capture, including any authentication-header sanitization applied during recording.
+
 In proxy-only mode, start your client in another terminal and point its base URL or proxy settings at the local proxy. Use the [client support matrix](docs/support-matrix.md) for exact wiring.
 
 When used as VSCode Claude Code's `claudeProcessWrapper`, claude-tap honors the Claude binary path passed by the extension.

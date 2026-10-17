@@ -17,8 +17,10 @@ from aiohttp import web
 from claude_tap.compact_trace import build_compact_trace_bundle
 from claude_tap.dashboard import (
     build_session_query,
+    dashboard_redaction_scope,
     dashboard_trace_snapshot,
     ensure_trace_store,
+    hide_dashboard_previews,
     list_trace_agents,
     list_trace_sessions,
     load_trace_session,
@@ -580,11 +582,15 @@ class LiveViewerServer:
                 "compact": f"/api/sessions/{quote(session_id)}/export/compact",
                 "html": f"/api/sessions/{quote(session_id)}/export/html",
             }
-            metadata = [
-                redact_dashboard_summary(item)
-                for record in store.load_records(session_id)
-                if (item := _extract_metadata_from_record(record)) is not None
-            ]
+            with dashboard_redaction_scope() as failures:
+                metadata = [
+                    redact_dashboard_summary(item)
+                    for record in store.load_records(session_id)
+                    if (item := _extract_metadata_from_record(record)) is not None
+                ]
+                if failures:
+                    for item in metadata:
+                        hide_dashboard_previews(item, ("sys_hint", "session_user_text", "error_message"))
             _generate_html_viewer_from_metadata(
                 metadata,
                 html_path,
