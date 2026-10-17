@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.146] - 2026-10-17
+
 ### Changed
 
 - Compute viewer costs using the Python pricing adapter.
