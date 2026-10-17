@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.1.146] - 2026-10-17
+
 ### 变更
 
 - 使用 Python 定价适配器计算查看器中的费用。
@@ -18,3 +20,4 @@
 - 将 claude-tap 的运行提示输出到 stderr，确保各模式均保留被包装客户端的 stdout。
 - dsh 使用 Anthropic 供应商时抓取 Anthropic 协议请求（`/v1/messages`）。
 - 避免 Dashboard 会话 token 总数重复计算缓存输入。
+
