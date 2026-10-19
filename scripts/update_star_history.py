@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate light and dark star-history charts from GitHub stargazer data."""
+"""Generate light and dark star-history charts from aggregate GitHub star-history data."""
 
 from __future__ import annotations
 
@@ -8,26 +8,13 @@ import json
 import os
 import re
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
-STARGAZERS_QUERY = """
-query StarHistory($owner: String!, $name: String!, $cursor: String) {
-  repository(owner: $owner, name: $name) {
-    stargazers(first: 100, after: $cursor, orderBy: {field: STARRED_AT, direction: ASC}) {
-      edges {
-        starredAt
-      }
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-    }
-  }
-}
-"""
+GITHUB_API_URL = "https://api.github.com"
+HISTORY_PAGE_SIZE = 30
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -41,62 +28,64 @@ def fetch_stargazer_timestamps(
     token: str | None,
     request_json: Callable[[Request], object] = _request_json,
 ) -> list[datetime]:
-    """Fetch every stargazer timestamp in chronological order."""
+    """Expand daily aggregate star counts into chronological chart timestamps."""
     if not REPO_PATTERN.fullmatch(repo) or any(part in {".", ".."} for part in repo.split("/")):
         raise ValueError("repo must use the OWNER/REPO format")
     if not token:
-        raise RuntimeError("GITHUB_TOKEN is required to fetch stargazer timestamps")
+        raise RuntimeError("GITHUB_TOKEN is required to fetch star history")
 
-    owner, name = repo.split("/")
     timestamps: list[datetime] = []
-    cursor = None
-    page = 0
-    while True:
-        page += 1
-        if page > 1000:
-            raise RuntimeError("GitHub stargazers pagination exceeded 1000 pages")
+    seen_weeks: set[int] = set()
+    for page in range(1, 101):
         request = Request(
-            GITHUB_GRAPHQL_URL,
-            data=json.dumps(
-                {
-                    "query": STARGAZERS_QUERY,
-                    "variables": {"owner": owner, "name": name, "cursor": cursor},
-                }
-            ).encode(),
+            f"{GITHUB_API_URL}/repos/{repo}/stargazers/history?per_page={HISTORY_PAGE_SIZE}&page={page}",
             headers={
                 "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2026-03-10",
                 "User-Agent": "claude-tap-star-history",
             },
-            method="POST",
+            method="GET",
         )
-        payload = request_json(request)
-        if not isinstance(payload, dict) or payload.get("errors"):
-            raise RuntimeError("GitHub GraphQL stargazers request failed")
         try:
-            stargazers = payload["data"]["repository"]["stargazers"]
-            edges = stargazers["edges"]
-            page_info = stargazers["pageInfo"]
-        except (KeyError, TypeError) as error:
-            raise RuntimeError("GitHub GraphQL response omitted stargazer data") from error
-        if not isinstance(edges, list):
-            raise RuntimeError("GitHub GraphQL stargazer edges were not a list")
-
-        for edge in edges:
-            if not isinstance(edge, dict) or not isinstance(edge.get("starredAt"), str):
-                raise RuntimeError("GitHub GraphQL response omitted starredAt")
-            timestamps.append(datetime.fromisoformat(edge["starredAt"].replace("Z", "+00:00")))
-
-        if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
-            raise RuntimeError("GitHub GraphQL response omitted pagination data")
-        if not page_info["hasNextPage"]:
+            payload = request_json(request)
+        except HTTPError as error:
+            detail = str(error.reason)
+            try:
+                body = json.load(error)
+                if isinstance(body, dict) and isinstance(body.get("message"), str):
+                    detail = body["message"]
+            except (ValueError, UnicodeError):
+                pass
+            detail = " ".join(detail.replace(token, "[REDACTED]").splitlines())[:1000]
+            raise RuntimeError(f"GitHub star-history request failed (HTTP {error.code}): {detail}") from None
+        if not isinstance(payload, list):
+            raise RuntimeError("GitHub star-history response was not a list")
+        for week in payload:
+            if not isinstance(week, dict) or type(week.get("week")) is not int:
+                raise RuntimeError("GitHub star-history response omitted the week timestamp")
+            days = week.get("days")
+            if (
+                not isinstance(days, list)
+                or len(days) != 7
+                or any(type(count) is not int or count < 0 for count in days)
+                or type(week.get("total")) is not int
+                or sum(days) != week["total"]
+            ):
+                raise RuntimeError("GitHub star-history response contained invalid daily counts")
+            if week["week"] in seen_weeks:
+                raise RuntimeError("GitHub star-history pagination repeated a week")
+            seen_weeks.add(week["week"])
+            start = datetime.fromtimestamp(week["week"], tz=UTC)
+            for day, count in enumerate(days):
+                timestamps.extend([start + timedelta(days=day)] * count)
+        if len(payload) < HISTORY_PAGE_SIZE:
             break
-        cursor = page_info.get("endCursor")
-        if not isinstance(cursor, str) or not cursor:
-            raise RuntimeError("GitHub GraphQL response omitted the next cursor")
+    else:
+        raise RuntimeError("GitHub star-history pagination exceeded 100 pages")
 
     if not timestamps:
-        raise RuntimeError(f"{repo} has no stargazer timestamps")
+        raise RuntimeError(f"{repo} has no star history")
     return sorted(timestamps)
 
 

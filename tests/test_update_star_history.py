@@ -1,8 +1,10 @@
 """Tests for the GitHub-native star-history chart updater."""
 
-import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -12,66 +14,77 @@ from scripts.update_star_history import fetch_stargazer_timestamps, render_chart
 
 def test_fetch_stargazer_timestamps_paginates_and_authenticates():
     requests = []
-    first_page = {
-        "data": {
-            "repository": {
-                "stargazers": {
-                    "edges": [{"starredAt": "2026-01-01T00:00:00Z"}],
-                    "pageInfo": {"hasNextPage": True, "endCursor": "next-page"},
-                }
-            }
-        }
-    }
-    second_page = {
-        "data": {
-            "repository": {
-                "stargazers": {
-                    "edges": [{"starredAt": "2026-01-03T00:00:00Z"}],
-                    "pageInfo": {"hasNextPage": False, "endCursor": None},
-                }
-            }
-        }
-    }
+    latest_week = datetime(2026, 8, 2, tzinfo=UTC)
+    first_page = [
+        {"week": int((latest_week - timedelta(weeks=n)).timestamp()), "total": 0, "days": [0] * 7} for n in range(30)
+    ]
+    first_page[0].update(total=3, days=[0, 0, 2, 0, 0, 0, 1])
+    older_week = latest_week - timedelta(weeks=30)
+    second_page = [{"week": int(older_week.timestamp()), "total": 1, "days": [1, 0, 0, 0, 0, 0, 0]}]
 
     def request_json(request):
         requests.append(request)
-        cursor = json.loads(request.data)["variables"]["cursor"]
-        return first_page if cursor is None else second_page
+        page = parse_qs(urlsplit(request.full_url).query)["page"][0]
+        return first_page if page == "1" else second_page
 
-    timestamps = fetch_stargazer_timestamps(
-        "liaohch3/claude-tap",
-        token="test-token",
-        request_json=request_json,
-    )
+    timestamps = fetch_stargazer_timestamps("liaohch3/claude-tap", "test-token", request_json)
 
-    assert len(timestamps) == 2
-    assert timestamps[0] == datetime(2026, 1, 1, tzinfo=UTC)
-    assert timestamps[-1] == datetime(2026, 1, 3, tzinfo=UTC)
-    assert [json.loads(request.data)["variables"]["cursor"] for request in requests] == [
-        None,
-        "next-page",
+    assert timestamps == [
+        older_week,
+        latest_week + timedelta(days=2),
+        latest_week + timedelta(days=2),
+        latest_week + timedelta(days=6),
     ]
-    assert all(request.full_url == "https://api.github.com/graphql" for request in requests)
-    assert requests[0].headers["Authorization"] == "Bearer test-token"
-    assert requests[0].headers["Content-type"] == "application/json"
-
-
-def test_fetch_stargazer_timestamps_rejects_malformed_payload():
-    with pytest.raises(RuntimeError, match="omitted starredAt"):
-        fetch_stargazer_timestamps(
-            "liaohch3/claude-tap",
-            token="test-token",
-            request_json=lambda _request: {
-                "data": {
-                    "repository": {
-                        "stargazers": {
-                            "edges": [{"node": {"login": "example"}}],
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        }
-                    }
-                }
-            },
+    assert len(requests) == 2
+    for page, request in enumerate(requests, start=1):
+        assert (
+            request.full_url
+            == f"https://api.github.com/repos/liaohch3/claude-tap/stargazers/history?per_page=30&page={page}"
         )
+        assert request.method == "GET"
+        assert request.data is None
+        assert request.headers["Authorization"] == "Bearer test-token"
+        assert request.headers["Accept"] == "application/vnd.github+json"
+        assert request.headers["X-github-api-version"] == "2026-03-10"
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"message": "Resource not accessible by integration"}, "not a list"),
+        ([{"days": [0] * 7, "total": 0}], "week timestamp"),
+        ([{"week": 0, "days": [1] * 6, "total": 6}], "daily counts"),
+        ([{"week": 0, "days": [-1] + [0] * 6, "total": -1}], "daily counts"),
+        ([{"week": 0, "days": [True] + [0] * 6, "total": 1}], "daily counts"),
+        ([{"week": 0, "days": [1] + [0] * 6, "total": 2}], "daily counts"),
+        ([{"week": 0, "days": [0] * 7, "total": 0}] * 2, "repeated a week"),
+        ([], "no star history"),
+    ],
+)
+def test_fetch_stargazer_timestamps_rejects_malformed_payload(payload, message):
+    with pytest.raises(RuntimeError, match=message):
+        fetch_stargazer_timestamps("liaohch3/claude-tap", "test-token", lambda _request: payload)
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (b'{"message":"Resource not accessible by integration"}', "Resource not accessible by integration"),
+        (b'{"message":"Authorization test-token\\nwas rejected"}', "Authorization [REDACTED] was rejected"),
+        (b"not JSON", "Forbidden"),
+    ],
+)
+def test_http_errors_report_the_cause_without_exposing_the_token(body, expected):
+    def request_json(request):
+        raise HTTPError(request.full_url, 403, "Forbidden", {}, BytesIO(body))
+
+    with pytest.raises(RuntimeError) as caught:
+        fetch_stargazer_timestamps("liaohch3/claude-tap", "test-token", request_json)
+    message = str(caught.value)
+    assert "HTTP 403" in message
+    assert expected in message
+    assert "test-token" not in message
+    assert "\n" not in message
 
 
 @pytest.mark.parametrize("repo", ["claude-tap", "owner/repo/extra", "../repo"])
