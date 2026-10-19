@@ -71,8 +71,16 @@ def fetch_stargazer_timestamps(
             method="POST",
         )
         payload = request_json(request)
-        if not isinstance(payload, dict) or payload.get("errors"):
+        if not isinstance(payload, dict):
             raise RuntimeError("GitHub GraphQL stargazers request failed")
+        if errors := payload.get("errors"):
+            messages = [
+                error["message"]
+                for error in (errors if isinstance(errors, list) else [])
+                if isinstance(error, dict) and isinstance(error.get("message"), str)
+            ]
+            detail = " ".join("; ".join(messages).replace(token, "[REDACTED]").splitlines())[:1000]
+            raise RuntimeError(f"GitHub GraphQL stargazers request failed: {detail or 'unknown error'}")
         try:
             stargazers = payload["data"]["repository"]["stargazers"]
             edges = stargazers["edges"]

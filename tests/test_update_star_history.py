@@ -74,6 +74,22 @@ def test_fetch_stargazer_timestamps_rejects_malformed_payload():
         )
 
 
+def test_graphql_errors_report_the_cause_without_exposing_the_token():
+    payload = {
+        "errors": [
+            {"message": "Resource not accessible by integration"},
+            {"message": "Authorization test-token\nwas rejected"},
+        ]
+    }
+    with pytest.raises(RuntimeError) as caught:
+        fetch_stargazer_timestamps("liaohch3/claude-tap", "test-token", lambda _request: payload)
+    message = str(caught.value)
+    assert "Resource not accessible by integration" in message
+    assert "Authorization [REDACTED] was rejected" in message
+    assert "test-token" not in message
+    assert "\n" not in message
+
+
 @pytest.mark.parametrize("repo", ["claude-tap", "owner/repo/extra", "../repo"])
 def test_fetch_stargazer_timestamps_rejects_invalid_repo(repo):
     with pytest.raises(ValueError, match="OWNER/REPO"):
