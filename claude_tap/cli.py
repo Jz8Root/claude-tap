@@ -344,7 +344,7 @@ def _trust_ca_for_current_user(ca_cert_path: Path, *, firefox: bool = False, chr
                 _print(f"Trusted in Firefox profile: {msg}")
             else:
                 _print(f"Firefox: {msg}", file=sys.stderr)
-                # non-fatal — don't override exit_code
+                # non-fatal -- don't override exit_code
 
     # --- Chrome NSS (Linux only) ---
     if chrome or (sys.platform.startswith("linux") and exit_code == 0):
@@ -816,10 +816,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  # Force reverse mode (single ANTHROPIC_BASE_URL provider only)\n"
             "  claude-tap --tap-client opencode --tap-proxy-mode reverse\n"
             "\n"
-            "mimo (MiMo Code — OpenCode fork; defaults to forward proxy mode):\n"
+            "mimo (MiMo Code -- OpenCode fork; defaults to forward proxy mode):\n"
             "  # Forward proxy captures every provider MiMo Code talks to\n"
             "  claude-tap --tap-client mimo\n"
-            "  # Reverse mode — single Anthropic provider with mimo-only disabled\n"
+            "  # Reverse mode -- single Anthropic provider with mimo-only disabled\n"
             "  claude-tap --tap-client mimo --tap-proxy-mode reverse\n"
             "\n"
             "openclaw:\n"
@@ -831,10 +831,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             '  claude-tap --tap-client pi -- --model openai-codex/gpt-5.3-codex-spark -p "hello"\n'
             "  # Pi OAuth is configured with /login inside pi, or via PI_CODING_AGENT_DIR\n"
             "\n"
-            "hermes agent (multi-provider Python agent — forward proxy default):\n"
-            "  # Interactive TUI — captures LLM calls directly\n"
+            "hermes agent (multi-provider Python agent -- forward proxy default):\n"
+            "  # Interactive TUI -- captures LLM calls directly\n"
             "  claude-tap --tap-client hermes\n"
-            "  # Gateway mode — captures LLM calls triggered by Slack/Telegram/etc. messages\n"
+            "  # Gateway mode -- captures LLM calls triggered by Slack/Telegram/etc. messages\n"
             "  #   (requires messaging platform configured in ~/.hermes/.env)\n"
             "  claude-tap --tap-client hermes -- gateway start\n"
             "\n"
@@ -888,7 +888,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  claude-tap browser                         Launch browser through forward proxy (auto-detect Chrome/Firefox)\n"
             "  claude-tap browser --browser firefox       Force Firefox\n"
             "  claude-tap browser --browser chrome        Force Chrome\n"
-            "  claude-tap browser --no-launch             Proxy-only — configure your browser manually\n"
+            "  claude-tap browser --no-launch             Proxy-only -- configure your browser manually\n"
             "  claude-tap browser --tap-port 8888         Use a fixed proxy port\n"
             "\n"
             "monitor recovery:\n"
@@ -1000,7 +1000,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tap-output-dir",
         default="./.traces",
         dest="output_dir",
-tml        help="Legacy trace directory to import once (default: ./.traces)",
+        help="Legacy trace directory to import once (default: ./.traces)",
     )
     storage_group.add_argument(
         "--tap-max-traces",
@@ -1230,7 +1230,7 @@ def parse_trust_ca_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--chrome",
         action="store_true",
         default=False,
-        help="Also install into Chrome/Chromium NSS store — Linux only (certutil required).",
+        help="Also install into Chrome/Chromium NSS store -- Linux only (certutil required).",
     )
     return parser.parse_args(argv)
 
@@ -1249,7 +1249,7 @@ def parse_browser_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="claude-tap browser",
         description=(
             "Launch a browser through the claude-tap forward proxy so web AI interfaces\n"
-            "(claude.ai, chatgpt.com, gemini.google.com, …) are intercepted and traced.\n\n"
+            "(claude.ai, chatgpt.com, gemini.google.com, ...) are intercepted and traced.\n\n"
             "The browser is started with the proxy pre-configured. The claude-tap CA is\n"
             "automatically installed into the browser's certificate store before launch."
         ),
@@ -1267,7 +1267,7 @@ def parse_browser_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--browser",
         choices=["chrome", "chromium", "firefox"],
         default=None,
-        help="Browser to launch (default: auto-detect Chrome → Chromium → Firefox).",
+        help="Browser to launch (default: auto-detect Chrome -> Chromium -> Firefox).",
     )
     parser.add_argument(
         "--tap-port",
@@ -1363,7 +1363,7 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
             "--no-default-browser-check",
             "--disable-sync",
         ]
-        _print(f"Launching {kind} → {exe}")
+        _print(f"Launching {kind} -> {exe}")
         _print(f"  proxy: http://{proxy_addr}")
         _print(f"  temp profile: {tmp_dir}")
 
@@ -1398,13 +1398,13 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
             trust_nss_ca(ca_cert_path, profile_dir)
         else:
             _print(
-                "Warning: certutil not found — Firefox may reject the proxy CA. "
+                "Warning: certutil not found -- Firefox may reject the proxy CA. "
                 "Install libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora).",
                 file=sys.stderr,
             )
 
         args_list = [exe, "--profile", str(profile_dir), "--no-remote"]
-        _print(f"Launching Firefox → {exe}")
+        _print(f"Launching Firefox -> {exe}")
         _print(f"  proxy: http://{proxy_addr}")
         _print(f"  temp profile: {profile_dir}")
 
@@ -1412,7 +1412,7 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
         _print(f"Unknown browser kind: {kind}", file=sys.stderr)
         return
 
-    subprocess.Popen(args_list)  # noqa: S603 — intentional, user-controlled browser path
+    subprocess.Popen(args_list)  # noqa: S603 -- intentional, user-controlled browser path
 
 
 async def _browser_proxy_main(args: argparse.Namespace) -> int:
@@ -1424,7 +1424,7 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
     ca = CertificateAuthority(ca_cert_path, ca_key_path)
 
     # Trust CA system-wide
-    _print("Installing claude-tap CA…")
+    _print("Installing claude-tap CA...")
     rc = _trust_ca_for_current_user(ca_cert_path, firefox=True, chrome=True)
     if rc != 0 and sys.platform.startswith("linux"):
         _print(
@@ -1468,7 +1468,7 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
             kind, exe = found
             _launch_browser_with_proxy(kind, exe, proxy_addr, ca_cert_path)
         else:
-            _print(f"\nProxy-only mode — configure your browser:")
+            _print(f"\nProxy-only mode -- configure your browser:")
             _print(f"  HTTP proxy:  http://{proxy_addr}")
             _print(f"  CA cert:     {ca_cert_path}")
 
