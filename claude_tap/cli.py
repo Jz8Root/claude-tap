@@ -1417,7 +1417,6 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
 
 async def _browser_proxy_main(args: argparse.Namespace) -> int:
     """Run the forward proxy for the browser subcommand."""
-    from claude_tap.trace import create_trace_writer
     from claude_tap.trace_store import get_trace_store
 
     ca_cert_path, ca_key_path = ensure_ca()
@@ -1433,7 +1432,7 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
         )
 
     store = get_trace_store()
-    writer = create_trace_writer(store)
+    writer = _create_trace_writer(store=store, client="browser", proxy_mode="forward", metadata={})
 
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
         proxy = ForwardProxyServer(
@@ -1443,6 +1442,22 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
             writer=writer,
             session=session,
             store_stream_events=False,
+            # Browser mode: only trace POST requests to known AI API paths.
+            # Filters out page loads, images, fonts, analytics, etc.
+            trace_methods=("POST",),
+            trace_path_prefixes=(
+                # claude.ai conversation completions
+                "/api/organizations/",
+                # chatgpt.com backend conversation
+                "/backend-api/conversation",
+                # Direct API clients that may also be open in the browser
+                "/v1/messages",
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/v1/responses",
+                "/v1beta/models/",
+                "/v1alpha/models/",
+            ),
         )
         actual_port = await proxy.start()
         proxy_addr = f"{args.host}:{actual_port}"
@@ -1451,8 +1466,17 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
 
         # Start dashboard
         dashboard_port = args.live_port
-        await ensure_shared_dashboard(args.host, dashboard_port, Path(".traces"))
-        dashboard = dashboard_url(args.host, dashboard_port)
+        try:
+            dashboard, _ = await ensure_shared_dashboard(
+                host=args.host,
+                port=dashboard_port,
+                output_dir=Path(".traces"),
+                open_browser=False,
+                open_browser_fn=_open_browser,
+            )
+        except (RuntimeError, Exception) as exc:
+            _print(f"Warning: dashboard failed to start: {exc}", file=sys.stderr)
+            dashboard = dashboard_url(args.host, dashboard_port)
         _print(f"Dashboard: {dashboard}")
 
         if not args.no_launch:
