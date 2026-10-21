@@ -366,7 +366,7 @@ class ForwardProxyServer:
             if method == "CONNECT":
                 await self._handle_connect(parts[1], reader, writer)
             else:
-                # Non-CONNECT request (plain HTTP proxy) -- not expected for HTTPS
+                # Non-CONNECT request (plain HTTP proxy) — not expected for HTTPS
                 # but handle gracefully
                 await self._handle_plain_proxy(method, parts[1], parts[2], reader, writer)
         except (ConnectionError, asyncio.TimeoutError, asyncio.CancelledError):
