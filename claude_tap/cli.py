@@ -24,7 +24,22 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from claude_tap.certs import CertificateAuthority, ensure_ca, is_macos_ca_trusted, trust_macos_ca
+from claude_tap.certs import (
+    CertificateAuthority,
+    ensure_ca,
+    is_linux_ca_trusted,
+    is_macos_ca_trusted,
+    is_nss_ca_trusted,
+    linux_ca_extra_dir,
+    linux_update_ca_command,
+    trust_chrome_nss_ca,
+    trust_firefox_ca,
+    trust_linux_ca,
+    trust_macos_ca,
+    trust_nss_ca,
+    _firefox_nss_profile_dirs,
+    _chrome_nss_profile_dirs,
+)
 from claude_tap.cli_clients import (
     _CODEX_CHATGPT_TARGET,
     CLIENT_CONFIGS,
@@ -264,33 +279,84 @@ def _extract_wrapped_client_command(client: str, args: list[str]) -> tuple[str |
     return None, args
 
 
-def _trust_ca_for_current_user(ca_cert_path: Path) -> int:
-    """Trust the forward-proxy CA in the current user's macOS login keychain."""
-    if sys.platform != "darwin":
-        _print("--tap-trust-ca is currently only supported on macOS.", file=sys.stderr)
-        _print(f"CA certificate: {ca_cert_path}", file=sys.stderr)
-        return 1
+def _trust_ca_for_current_user(ca_cert_path: Path, *, firefox: bool = False, chrome: bool = False) -> int:
+    """Trust the forward-proxy CA for the current user.
 
-    if is_macos_ca_trusted(ca_cert_path):
-        _print(f"🔐 CA already trusted in the macOS login keychain: {ca_cert_path}")
-        return 0
+    On macOS: user login keychain (no sudo).
+    On Linux: system CA store (may need sudo) + optional NSS stores.
+    firefox/chrome: also install into browser NSS profiles.
+    """
+    exit_code = 0
 
-    result = trust_macos_ca(ca_cert_path)
-    if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
-        _print("Error: failed to trust claude-tap CA in the macOS login keychain.", file=sys.stderr)
-        if details:
-            _print(details, file=sys.stderr)
-        _print("This command does not use sudo; macOS may require unlocking your login keychain.", file=sys.stderr)
-        return result.returncode or 1
+    # --- macOS ---
+    if sys.platform == "darwin":
+        if is_macos_ca_trusted(ca_cert_path):
+            _print(f"CA already trusted in the macOS login keychain: {ca_cert_path}")
+        else:
+            result = trust_macos_ca(ca_cert_path)
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout or "").strip()
+                _print("Error: failed to trust claude-tap CA in the macOS login keychain.", file=sys.stderr)
+                if details:
+                    _print(details, file=sys.stderr)
+                _print(
+                    "This command does not use sudo; macOS may require unlocking your login keychain.",
+                    file=sys.stderr,
+                )
+                exit_code = result.returncode or 1
+            elif not is_macos_ca_trusted(ca_cert_path):
+                _print(
+                    "Error: macOS did not report the claude-tap CA as trusted after installation.",
+                    file=sys.stderr,
+                )
+                exit_code = 1
+            else:
+                _print(f"Trusted claude-tap CA in the macOS login keychain: {ca_cert_path}")
 
-    if not is_macos_ca_trusted(ca_cert_path):
-        _print("Error: macOS did not report the claude-tap CA as trusted after installation.", file=sys.stderr)
-        _print(f"CA certificate: {ca_cert_path}", file=sys.stderr)
-        return 1
+    # --- Linux ---
+    elif sys.platform.startswith("linux"):
+        if is_linux_ca_trusted(ca_cert_path):
+            extra_dir = linux_ca_extra_dir()
+            _print(f"CA already installed in {extra_dir / 'claude-tap.crt'}")
+        else:
+            ok, msg = trust_linux_ca(ca_cert_path)
+            if ok:
+                _print(f"Trusted claude-tap CA: {msg}")
+                update_cmd = linux_update_ca_command()
+                _print(f"  ran: {update_cmd}")
+            else:
+                _print(f"Error: {msg}", file=sys.stderr)
+                exit_code = 1
 
-    _print(f"🔐 Trusted claude-tap CA in the current user's macOS login keychain: {ca_cert_path}")
-    return 0
+    else:
+        _print(
+            f"trust-ca: unsupported platform {sys.platform}. "
+            "Use --firefox / --chrome to install into browser NSS stores only.",
+            file=sys.stderr,
+        )
+        exit_code = 1
+
+    # --- Firefox NSS ---
+    if firefox or (sys.platform.startswith("linux") and exit_code == 0):
+        results = trust_firefox_ca(ca_cert_path)
+        for ok, msg in results:
+            if ok:
+                _print(f"Trusted in Firefox profile: {msg}")
+            else:
+                _print(f"Firefox: {msg}", file=sys.stderr)
+                # non-fatal — don't override exit_code
+
+    # --- Chrome NSS (Linux only) ---
+    if chrome or (sys.platform.startswith("linux") and exit_code == 0):
+        results = trust_chrome_nss_ca(ca_cert_path)
+        for ok, msg in results:
+            if ok:
+                _print(f"Trusted in Chrome/Chromium NSS: {msg}")
+            else:
+                # Chrome NSS absent is expected on many systems, don't fail
+                log.debug("Chrome NSS: %s", msg)
+
+    return exit_code
 
 
 def _ensure_ca_trust_for_forward_proxy(args: argparse.Namespace, ca_cert_path: Path) -> int:
@@ -308,7 +374,7 @@ def _ensure_ca_trust_for_forward_proxy(args: argparse.Namespace, ca_cert_path: P
     if is_macos_ca_trusted(ca_cert_path):
         return 0
 
-    _print(f"🔐 {cfg.label} needs the claude-tap CA trusted in your macOS login keychain.")
+    _print(f"\U0001f510 {cfg.label} needs the claude-tap CA trusted in your macOS login keychain.")
     _print("   Installing for the current user only; no sudo or System keychain write is used.")
     return _trust_ca_for_current_user(ca_cert_path)
 
@@ -382,9 +448,9 @@ async def _async_main(args: argparse.Namespace) -> int:
                 open_browser_fn=_open_browser,
             )
             if spawned:
-                _print(f"🌐 Dashboard: {dashboard_url_value}")
+                _print(f"\U0001f310 Dashboard: {dashboard_url_value}")
             else:
-                _print(f"🌐 Dashboard: {dashboard_url_value} (shared)")
+                _print(f"\U0001f310 Dashboard: {dashboard_url_value} (shared)")
         except (RuntimeError, sqlite3.Error) as exc:
             _print(f"⚠️  {exc}", file=sys.stderr)
 
@@ -414,12 +480,12 @@ async def _async_main(args: argparse.Namespace) -> int:
     exit_code = 0
     capture_only = bool(getattr(args, "export_prompt", None))
     if capture_only and not transcript_only:
-        _print("📝 Prompt export mode: upstream calls are skipped after capture.")
+        _print("\U0001f4dd Prompt export mode: upstream calls are skipped after capture.")
     try:
         if transcript_only:
-            _print(f"🔍 claude-tap v{__version__} watching Cursor agent-transcripts")
+            _print(f"\U0001f50d claude-tap v{__version__} watching Cursor agent-transcripts")
             _print("   Mode: one tap session per Cursor conversation JSONL")
-            _print(f"🗄️  Trace database: {resolve_db_path()}")
+            _print(f"\U0001f5c4️  Trace database: {resolve_db_path()}")
             cursor_watcher = CursorTranscriptWatcher(
                 since=watch_since,
                 model=model_from_cursor_args(args.claude_args),
@@ -490,7 +556,7 @@ async def _async_main(args: argparse.Namespace) -> int:
                     capture_only=capture_only,
                 )
                 actual_port = await forward_server.start()
-                _print(f"🔍 claude-tap v{__version__} forward proxy on http://{args.host}:{actual_port}")
+                _print(f"\U0001f50d claude-tap v{__version__} forward proxy on http://{args.host}:{actual_port}")
                 _print(f"   CA cert: {ca_cert_path}")
             else:
                 assert session is not None
@@ -522,10 +588,10 @@ async def _async_main(args: argparse.Namespace) -> int:
                     actual_port = site._server.sockets[0].getsockname()[1]
                 except (AttributeError, IndexError, OSError):
                     actual_port = args.port
-                _print(f"🔍 claude-tap v{__version__} listening on http://{args.host}:{actual_port}")
+                _print(f"\U0001f50d claude-tap v{__version__} listening on http://{args.host}:{actual_port}")
 
-            _print(f"📁 Trace session: {session_id}")
-            _print(f"🗄️  Trace database: {resolve_db_path()}")
+            _print(f"\U0001f4c1 Trace session: {session_id}")
+            _print(f"\U0001f5c4️  Trace database: {resolve_db_path()}")
 
             if not args.no_launch:
                 try:
@@ -607,7 +673,7 @@ async def _async_main(args: argparse.Namespace) -> int:
                 _print(f"\nclaude-tap: trace cleanup skipped because storage is unavailable ({exc})", file=sys.stderr)
             else:
                 if cleaned:
-                    _print(f"\n🧹 Cleaned up {cleaned} old trace session(s)")
+                    _print(f"\n\U0001f9f9 Cleaned up {cleaned} old trace session(s)")
 
         # Print summary with cost estimation
         if cursor_watcher is not None:
@@ -624,7 +690,7 @@ async def _async_main(args: argparse.Namespace) -> int:
                 "models_used": {},
                 "has_error": False,
             }
-        _print("\n📊 Trace summary:")
+        _print("\n\U0001f4ca Trace summary:")
         _print(f"   API calls: {stats['api_calls']}")
         if stats.get("trace_storage_errors"):
             _print(f"   Trace storage errors: {stats['trace_storage_errors']}")
@@ -672,10 +738,10 @@ def _export_prompt_from_session(store, session_id: str, output: str) -> int:
     path = Path(output).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    _print(f"📝 Prompt snapshot: {path}")
+    _print(f"\U0001f4dd Prompt snapshot: {path}")
     trace_path = _prompt_trace_path(path)
     trace_path.write_text(store.export_jsonl(session_id), encoding="utf-8")
-    _print(f"🧾 Raw trace: {trace_path}")
+    _print(f"\U0001f9fe Raw trace: {trace_path}")
     return 0
 
 
@@ -814,7 +880,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  claude-tap dashboard --tap-live-port 3000  Use a fixed dashboard port\n"
             "\n"
             "trust local CA:\n"
-            "  claude-tap trust-ca                        Trust forward-proxy CA in macOS user keychain\n"
+            "  claude-tap trust-ca                        Trust CA in system store (macOS keychain / Linux ca-certificates)\n"
+            "  claude-tap trust-ca --firefox              Also trust in Firefox NSS profiles (certutil)\n"
+            "  claude-tap trust-ca --chrome               Also trust in Chrome/Chromium NSS store (Linux)\n"
+            "\n"
+            "browser (web AI interception):\n"
+            "  claude-tap browser                         Launch browser through forward proxy (auto-detect Chrome/Firefox)\n"
+            "  claude-tap browser --browser firefox       Force Firefox\n"
+            "  claude-tap browser --browser chrome        Force Chrome\n"
+            "  claude-tap browser --no-launch             Proxy-only — configure your browser manually\n"
+            "  claude-tap browser --tap-port 8888         Use a fixed proxy port\n"
             "\n"
             "monitor recovery:\n"
             "  claude-tap monitor-restore                 Restore Claude/Codex configs after a killed monitor\n"
@@ -925,7 +1000,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tap-output-dir",
         default="./.traces",
         dest="output_dir",
-        help="Legacy trace directory to import once (default: ./.traces)",
+tml        help="Legacy trace directory to import once (default: ./.traces)",
     )
     storage_group.add_argument(
         "--tap-max-traces",
@@ -1091,8 +1166,8 @@ async def dashboard_main(args: argparse.Namespace) -> int:
     if await _is_dashboard_reusable(host, port):
         migrate_legacy_traces(output_dir)
         url = dashboard_url(host, port)
-        _print(f"🌐 claude-tap dashboard already running: {url}")
-        _print(f"🗄️  Trace database: {resolve_db_path()}")
+        _print(f"\U0001f310 claude-tap dashboard already running: {url}")
+        _print(f"\U0001f5c4️  Trace database: {resolve_db_path()}")
         if args.open_viewer:
             _open_browser(url)
         return 0
@@ -1112,15 +1187,15 @@ async def dashboard_main(args: argparse.Namespace) -> int:
         if await _is_dashboard_reusable(host, port):
             migrate_legacy_traces(output_dir)
             url = dashboard_url(host, port)
-            _print(f"🌐 claude-tap dashboard already running: {url}")
+            _print(f"\U0001f310 claude-tap dashboard already running: {url}")
             if args.open_viewer:
                 _open_browser(url)
             return 0
         raise
-    _print(f"🌐 claude-tap dashboard: {server.url}")
-    _print(f"🗄️  Trace database: {resolve_db_path()}")
+    _print(f"\U0001f310 claude-tap dashboard: {server.url}")
+    _print(f"\U0001f5c4️  Trace database: {resolve_db_path()}")
     if output_dir.exists():
-        _print(f"📁 Legacy import dir: {output_dir}")
+        _print(f"\U0001f4c1 Legacy import dir: {output_dir}")
     _print("Press Ctrl+C to stop.")
     if args.open_viewer:
         _open_browser(server.url)
@@ -1140,18 +1215,281 @@ def parse_trust_ca_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="claude-tap trust-ca",
         description=(
-            "Trust the claude-tap forward-proxy CA in the current user's macOS login keychain. "
-            "This does not use sudo or the System keychain."
+            "Trust the claude-tap forward-proxy CA for the current user.\n"
+            "  macOS: user login keychain (no sudo).\n"
+            "  Linux: system CA store (may need sudo) + Firefox/Chrome NSS."
         ),
+    )
+    parser.add_argument(
+        "--firefox",
+        action="store_true",
+        default=False,
+        help="Also install into Firefox NSS profiles (certutil required).",
+    )
+    parser.add_argument(
+        "--chrome",
+        action="store_true",
+        default=False,
+        help="Also install into Chrome/Chromium NSS store — Linux only (certutil required).",
     )
     return parser.parse_args(argv)
 
 
 def trust_ca_main(argv: list[str] | None = None) -> int:
     """Entry point for the trust-ca subcommand."""
-    parse_trust_ca_args(argv)
+    args = parse_trust_ca_args(argv)
     ca_cert_path, _ = ensure_ca()
-    return _trust_ca_for_current_user(ca_cert_path)
+    return _trust_ca_for_current_user(ca_cert_path, firefox=args.firefox, chrome=args.chrome)
+
+
+# ---------------------------------------------------------------------------
+def parse_browser_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse arguments for the browser subcommand."""
+    parser = argparse.ArgumentParser(
+        prog="claude-tap browser",
+        description=(
+            "Launch a browser through the claude-tap forward proxy so web AI interfaces\n"
+            "(claude.ai, chatgpt.com, gemini.google.com, …) are intercepted and traced.\n\n"
+            "The browser is started with the proxy pre-configured. The claude-tap CA is\n"
+            "automatically installed into the browser's certificate store before launch."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  claude-tap browser                     # auto-detect browser, start proxy\n"
+            "  claude-tap browser --browser chrome\n"
+            "  claude-tap browser --browser firefox\n"
+            "  claude-tap browser --tap-port 8888\n"
+            "  claude-tap browser --no-launch         # proxy-only, configure browser manually\n"
+        ),
+    )
+    parser.add_argument(
+        "--browser",
+        choices=["chrome", "chromium", "firefox"],
+        default=None,
+        help="Browser to launch (default: auto-detect Chrome → Chromium → Firefox).",
+    )
+    parser.add_argument(
+        "--tap-port",
+        type=int,
+        default=0,
+        dest="port",
+        help="Forward proxy port (default: auto).",
+    )
+    parser.add_argument(
+        "--tap-host",
+        default="127.0.0.1",
+        dest="host",
+        help="Proxy bind address (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--no-launch",
+        action="store_true",
+        default=False,
+        help="Start the proxy but do not launch the browser (configure it manually).",
+    )
+    parser.add_argument(
+        "--trust-ca",
+        action="store_true",
+        default=False,
+        dest="trust_ca",
+        help="Force CA trust installation even if already trusted.",
+    )
+    parser.add_argument(
+        "--tap-live-port",
+        type=int,
+        default=DEFAULT_DASHBOARD_PORT,
+        dest="live_port",
+        help=f"Dashboard port (default: {DEFAULT_DASHBOARD_PORT}).",
+    )
+    return parser.parse_args(argv)
+
+
+def _find_browser_executable(browser: str | None) -> tuple[str, str] | None:
+    """Return (kind, path) for the requested browser, or None if not found."""
+    candidates: list[tuple[str, list[str]]]
+    if browser == "firefox":
+        candidates = [("firefox", ["firefox", "firefox-esr"])]
+    elif browser in ("chrome", "chromium"):
+        _chrome_names = ["google-chrome", "google-chrome-stable", "chrome"]
+        _chromium_names = ["chromium-browser", "chromium"]
+        if browser == "chrome":
+            candidates = [("chrome", _chrome_names), ("chromium", _chromium_names)]
+        else:
+            candidates = [("chromium", _chromium_names)]
+    else:
+        # Auto-detect: Chrome > Chromium > Firefox
+        candidates = [
+            ("chrome", ["google-chrome", "google-chrome-stable", "chrome"]),
+            ("chromium", ["chromium-browser", "chromium"]),
+            ("firefox", ["firefox", "firefox-esr"]),
+        ]
+
+    for kind, names in candidates:
+        for name in names:
+            path = shutil.which(name)
+            if path:
+                return kind, path
+    return None
+
+
+def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_path: Path) -> None:
+    """Launch the browser configured to use the forward proxy."""
+    import subprocess
+    import tempfile
+
+    if kind in ("chrome", "chromium"):
+        # Chromium/Chrome: dedicated temp profile so we don't pollute the real one.
+        # We install the CA into the temp profile's NSS db before launch.
+        tmp_dir = Path(tempfile.mkdtemp(prefix="claude-tap-chrome-"))
+        nss_dir = tmp_dir / "Default"
+        nss_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create NSS db in the temp profile
+        certutil = shutil.which("certutil")
+        if certutil:
+            subprocess.run(
+                [certutil, "-N", "-d", f"sql:{nss_dir}", "--empty-password"],
+                capture_output=True,
+                check=False,
+            )
+            trust_nss_ca(ca_cert_path, nss_dir)
+
+        args_list = [
+            exe,
+            f"--proxy-server=http://{proxy_addr}",
+            f"--user-data-dir={tmp_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+        ]
+        _print(f"Launching {kind} → {exe}")
+        _print(f"  proxy: http://{proxy_addr}")
+        _print(f"  temp profile: {tmp_dir}")
+
+    elif kind == "firefox":
+        # Firefox: temp profile + user.js to inject proxy settings
+        tmp_dir = Path(tempfile.mkdtemp(prefix="claude-tap-firefox-"))
+        profile_dir = tmp_dir / "profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        host, port_str = proxy_addr.rsplit(":", 1)
+        port_int = int(port_str)
+
+        # Inject proxy config and CA trust via user.js
+        user_js = profile_dir / "user.js"
+        user_js.write_text(
+            f'user_pref("network.proxy.type", 1);\n'
+            f'user_pref("network.proxy.http", "{host}");\n'
+            f'user_pref("network.proxy.http_port", {port_int});\n'
+            f'user_pref("network.proxy.ssl", "{host}");\n'
+            f'user_pref("network.proxy.ssl_port", {port_int});\n'
+            f'user_pref("network.proxy.no_proxies_on", "localhost,127.0.0.1");\n'
+        )
+
+        # Trust CA in the temp profile NSS db
+        certutil = shutil.which("certutil")
+        if certutil:
+            subprocess.run(
+                [certutil, "-N", "-d", f"sql:{profile_dir}", "--empty-password"],
+                capture_output=True,
+                check=False,
+            )
+            trust_nss_ca(ca_cert_path, profile_dir)
+        else:
+            _print(
+                "Warning: certutil not found — Firefox may reject the proxy CA. "
+                "Install libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora).",
+                file=sys.stderr,
+            )
+
+        args_list = [exe, "--profile", str(profile_dir), "--no-remote"]
+        _print(f"Launching Firefox → {exe}")
+        _print(f"  proxy: http://{proxy_addr}")
+        _print(f"  temp profile: {profile_dir}")
+
+    else:
+        _print(f"Unknown browser kind: {kind}", file=sys.stderr)
+        return
+
+    subprocess.Popen(args_list)  # noqa: S603 — intentional, user-controlled browser path
+
+
+async def _browser_proxy_main(args: argparse.Namespace) -> int:
+    """Run the forward proxy for the browser subcommand."""
+    from claude_tap.trace import create_trace_writer
+    from claude_tap.trace_store import get_trace_store
+
+    ca_cert_path, ca_key_path = ensure_ca()
+    ca = CertificateAuthority(ca_cert_path, ca_key_path)
+
+    # Trust CA system-wide
+    _print("Installing claude-tap CA…")
+    rc = _trust_ca_for_current_user(ca_cert_path, firefox=True, chrome=True)
+    if rc != 0 and sys.platform.startswith("linux"):
+        _print(
+            "Hint: system CA install may need sudo. Browser NSS trust was attempted regardless.",
+            file=sys.stderr,
+        )
+
+    store = get_trace_store()
+    writer = create_trace_writer(store)
+
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
+        proxy = ForwardProxyServer(
+            host=args.host,
+            port=args.port,
+            ca=ca,
+            writer=writer,
+            session=session,
+            store_stream_events=False,
+        )
+        actual_port = await proxy.start()
+        proxy_addr = f"{args.host}:{actual_port}"
+        _print(f"Forward proxy listening on http://{proxy_addr}")
+        _print("Capturing: claude.ai, chatgpt.com, gemini.google.com and all HTTPS traffic")
+
+        # Start dashboard
+        dashboard_port = args.live_port
+        await ensure_shared_dashboard(args.host, dashboard_port, Path(".traces"))
+        dashboard = dashboard_url(args.host, dashboard_port)
+        _print(f"Dashboard: {dashboard}")
+
+        if not args.no_launch:
+            found = _find_browser_executable(args.browser)
+            if found is None:
+                _print(
+                    "No supported browser found. Install Chrome, Chromium, or Firefox, "
+                    "or use --no-launch and configure your browser manually.",
+                    file=sys.stderr,
+                )
+                await proxy.stop()
+                return 1
+            kind, exe = found
+            _launch_browser_with_proxy(kind, exe, proxy_addr, ca_cert_path)
+        else:
+            _print(f"\nProxy-only mode — configure your browser:")
+            _print(f"  HTTP proxy:  http://{proxy_addr}")
+            _print(f"  CA cert:     {ca_cert_path}")
+
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            await proxy.stop()
+
+    return 0
+
+
+def browser_main(argv: list[str] | None = None) -> int:
+    """Entry point for the browser subcommand."""
+    args = parse_browser_args(argv)
+    try:
+        return asyncio.run(_browser_proxy_main(args))
+    except KeyboardInterrupt:
+        return 0
 
 
 def main_entry() -> None:
@@ -1167,6 +1505,9 @@ def main_entry() -> None:
 
     if len(sys.argv) > 1 and sys.argv[1] == "trust-ca":
         sys.exit(trust_ca_main(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "browser":
+        sys.exit(browser_main(sys.argv[2:]))
 
     if len(sys.argv) > 1 and sys.argv[1] == "monitor-restore":
         from claude_tap import global_inject

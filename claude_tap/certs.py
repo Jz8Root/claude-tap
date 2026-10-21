@@ -10,8 +10,11 @@ from __future__ import annotations
 import datetime
 import ipaddress
 import logging
+import shutil
 import ssl
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 from cryptography import x509
@@ -172,6 +175,186 @@ def trust_macos_ca(ca_cert_path: Path, keychain_path: Path | None = None) -> sub
         check=False,
     )
 
+
+# ---------------------------------------------------------------------------
+# Linux system CA trust
+# ---------------------------------------------------------------------------
+
+def _linux_ca_bundle_dirs() -> list[Path]:
+    """Return candidate system CA extra-certs directories, most-specific first."""
+    return [
+        Path("/usr/local/share/ca-certificates"),   # Debian/Ubuntu
+        Path("/etc/pki/ca-trust/source/anchors"),    # Fedora/RHEL/CentOS
+        Path("/etc/ca-certificates/trust-source/anchors"),  # Arch
+        Path("/usr/share/pki/trust/anchors"),        # openSUSE
+    ]
+
+
+def linux_ca_extra_dir() -> Path | None:
+    """Return the first writable system CA extra-certs directory, or None."""
+    for d in _linux_ca_bundle_dirs():
+        if d.exists():
+            return d
+    return None
+
+
+def linux_update_ca_command() -> str | None:
+    """Return the distro's update-ca command, or None if not found."""
+    for cmd in ("update-ca-certificates", "update-ca-trust", "trust"):
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
+def is_linux_ca_trusted(ca_cert_path: Path) -> bool:
+    """Return True when the CA cert is already present in the system extra-certs dir."""
+    extra_dir = linux_ca_extra_dir()
+    if extra_dir is None:
+        return False
+    dest = extra_dir / "claude-tap.crt"
+    if not dest.exists():
+        return False
+    try:
+        return dest.read_bytes() == ca_cert_path.read_bytes()
+    except OSError:
+        return False
+
+
+def trust_linux_ca(ca_cert_path: Path) -> tuple[bool, str]:
+    """Install the CA into the system store and run update-ca-certificates.
+
+    Returns (success, message). Requires write access to the CA extra-certs dir
+    (typically needs sudo); the caller is responsible for privilege escalation.
+    """
+    extra_dir = linux_ca_extra_dir()
+    if extra_dir is None:
+        return False, "No supported system CA extra-certs directory found."
+
+    dest = extra_dir / "claude-tap.crt"
+    try:
+        dest.write_bytes(ca_cert_path.read_bytes())
+    except PermissionError:
+        return False, f"Permission denied writing to {dest} — re-run with sudo."
+
+    update_cmd = linux_update_ca_command()
+    if update_cmd is None:
+        return False, f"CA copied to {dest} but no update-ca command found (install ca-certificates)."
+
+    result = subprocess.run([update_cmd], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        return False, f"{update_cmd} failed: {details}"
+
+    return True, str(dest)
+
+
+# ---------------------------------------------------------------------------
+# Firefox NSS trust (certutil)
+# ---------------------------------------------------------------------------
+
+def _firefox_nss_profile_dirs() -> list[Path]:
+    """Return existing Firefox NSS profile directories for the current user."""
+    candidates: list[Path] = []
+    home = Path.home()
+    if sys.platform == "darwin":
+        base = home / "Library" / "Application Support" / "Firefox" / "Profiles"
+    else:
+        base = home / ".mozilla" / "firefox"
+
+    if base.is_dir():
+        for p in base.iterdir():
+            if p.is_dir() and (p / "cert9.db").exists():
+                candidates.append(p)
+            elif p.is_dir() and (p / "cert8.db").exists():
+                candidates.append(p)
+
+    # Snap Firefox
+    snap_base = home / "snap" / "firefox" / "current" / ".mozilla" / "firefox"
+    if snap_base.is_dir():
+        for p in snap_base.iterdir():
+            if p.is_dir() and ((p / "cert9.db").exists() or (p / "cert8.db").exists()):
+                candidates.append(p)
+
+    return candidates
+
+
+def _chrome_nss_profile_dirs() -> list[Path]:
+    """Return existing Chromium/Chrome NSS profile directories (Linux only)."""
+    candidates: list[Path] = []
+    home = Path.home()
+    bases = [
+        home / ".pki" / "nssdb",               # Chromium shared NSS on Linux
+        home / ".config" / "google-chrome",     # Chrome
+        home / ".config" / "chromium",          # Chromium
+        home / "snap" / "chromium" / "current" / ".pki" / "nssdb",
+    ]
+    for b in bases:
+        if b.is_dir():
+            candidates.append(b)
+    return candidates
+
+
+def _certutil_bin() -> str | None:
+    return shutil.which("certutil")
+
+
+def is_nss_ca_trusted(nss_dir: Path) -> bool:
+    """Return True when the claude-tap CA is trusted in the given NSS database."""
+    certutil = _certutil_bin()
+    if certutil is None:
+        return False
+    result = subprocess.run(
+        [certutil, "-L", "-d", f"sql:{nss_dir}", "-n", "claude-tap"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def trust_nss_ca(ca_cert_path: Path, nss_dir: Path, nickname: str = "claude-tap") -> tuple[bool, str]:
+    """Add the CA to the given NSS database with trust bits CT,,."""
+    certutil = _certutil_bin()
+    if certutil is None:
+        return False, "certutil not found — install libnss3-tools (Debian/Ubuntu) or nss-tools (Fedora)."
+
+    # Remove any existing entry first (ignore failure — may not exist)
+    subprocess.run(
+        [certutil, "-D", "-d", f"sql:{nss_dir}", "-n", nickname],
+        capture_output=True,
+        check=False,
+    )
+
+    result = subprocess.run(
+        [certutil, "-A", "-d", f"sql:{nss_dir}", "-n", nickname, "-t", "CT,,", "-i", str(ca_cert_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        return False, f"certutil failed for {nss_dir}: {details}"
+
+    return True, str(nss_dir)
+
+
+def trust_firefox_ca(ca_cert_path: Path) -> list[tuple[bool, str]]:
+    """Trust CA in all detected Firefox NSS profiles. Returns one (ok, msg) per profile."""
+    profiles = _firefox_nss_profile_dirs()
+    if not profiles:
+        return [(False, "No Firefox NSS profiles found.")]
+    return [trust_nss_ca(ca_cert_path, p) for p in profiles]
+
+
+def trust_chrome_nss_ca(ca_cert_path: Path) -> list[tuple[bool, str]]:
+    """Trust CA in Chrome/Chromium NSS stores (Linux). Returns one (ok, msg) per store."""
+    dirs = _chrome_nss_profile_dirs()
+    if not dirs:
+        return [(False, "No Chrome/Chromium NSS databases found.")]
+    return [trust_nss_ca(ca_cert_path, d) for d in dirs]
+
+
+# ---------------------------------------------------------------------------
 
 def _load_ca(ca_cert_path: Path, ca_key_path: Path) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
     """Load CA cert and key from PEM files."""
