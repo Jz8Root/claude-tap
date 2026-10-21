@@ -1554,7 +1554,7 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
     return 0
 
 
-def browser_main(argv: list[str] | None = -> int:
+def browser_main(argv: list[str] | None = None) -> int:
     """Entry point for the browser subcommand."""
     args = parse_browser_args(argv)
     try:
