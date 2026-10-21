@@ -42,6 +42,7 @@ except ImportError:
 
 from claude_tap.bedrock import attach_bedrock_errors, is_bedrock_eventstream_path
 from claude_tap.certs import CertificateAuthority
+from claude_tap.web_ai import is_web_ai_host, normalize_web_ai_request
 from claude_tap.proxy import (
     HOP_BY_HOP,
     _build_record,
@@ -118,7 +119,8 @@ def _upstream_base_url(upstream_url: str, request_path: str) -> str | None:
 def _matches_path_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
     clean = path.split("?", 1)[0].rstrip("/")
     return any(
-        clean == prefix or clean.startswith(prefix + "/") or clean.startswith(prefix + ":") for prefix in prefixes
+        clean == prefix or clean.startswith(prefix + "/") or clean.startswith(prefix + ":")
+        for prefix in prefixes
     )
 
 
@@ -364,7 +366,7 @@ class ForwardProxyServer:
             if method == "CONNECT":
                 await self._handle_connect(parts[1], reader, writer)
             else:
-                # Non-CONNECT request (plain HTTP proxy) — not expected for HTTPS
+                # Non-CONNECT request (plain HTTP proxy) -- not expected for HTTPS
                 # but handle gracefully
                 await self._handle_plain_proxy(method, parts[1], parts[2], reader, writer)
         except (ConnectionError, asyncio.TimeoutError, asyncio.CancelledError):
@@ -569,6 +571,12 @@ class ForwardProxyServer:
         req_body = _parse_request_body_for_trace(trace_body, headers)
         upstream_base_url = _upstream_base_url(upstream_url, path)
 
+        # Normalize web AI interface request bodies (claude.ai, chatgpt.com)
+        # so messages appear in standard Anthropic/OpenAI format in the viewer.
+        _upstream_hostname = urlparse(upstream_url).hostname or ""
+        if is_web_ai_host(_upstream_hostname):
+            req_body = normalize_web_ai_request(_upstream_hostname, path, req_body)
+
         is_streaming = is_capture_only_streaming_request(path, req_body)
 
         model = req_body.get("model", "") if isinstance(req_body, dict) else ""
@@ -656,6 +664,14 @@ class ForwardProxyServer:
             duration_ms = int((time.monotonic() - t0) * 1000)
             log.debug(f"{log_prefix} <- {upstream_resp.status} ({duration_ms}ms, {total_bytes} bytes, trace skipped)")
             return
+
+        # Re-detect streaming from the actual response Content-Type.
+        # Web AI interfaces (claude.ai, chatgpt.com) don't always set "stream": true
+        # in the request body, so path/body heuristics alone aren't enough.
+        if not is_streaming and upstream_resp.status == 200:
+            resp_ct = _header_value(dict(upstream_resp.headers), "Content-Type").lower()
+            if "text/event-stream" in resp_ct:
+                is_streaming = True
 
         assert turn is not None
         if is_streaming and upstream_resp.status == 200:
