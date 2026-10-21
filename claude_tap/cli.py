@@ -1333,6 +1333,46 @@ def _find_browser_executable(browser: str | None) -> tuple[str, str] | None:
     return None
 
 
+def _compute_spki_hash_b64(ca_cert_path: Path) -> str | None:
+    """Return base64-SHA-256 of the CA public key (SPKI) for Chrome's cert pinning flag."""
+    import base64
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
+        pub_key_der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        h = hashes.Hash(hashes.SHA256())
+        h.update(pub_key_der)
+        return base64.b64encode(h.finalize()).decode()
+    except Exception:
+        return None
+
+
+def _ensure_user_chrome_nss_trust(ca_cert_path: Path) -> None:
+    """Trust CA in the user's shared NSS store (~/.pki/nssdb), creating it if absent.
+
+    Chrome <117 reads this store regardless of --user-data-dir.
+    Chrome 117+ ignores NSS entirely; the SPKI-list flag covers those versions.
+    """
+    import subprocess
+    nss_db = Path.home() / ".pki" / "nssdb"
+    certutil = shutil.which("certutil")
+    if certutil is None:
+        return
+    if not nss_db.exists():
+        nss_db.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [certutil, "-N", "-d", f"sql:{nss_db}", "--empty-password"],
+            capture_output=True,
+            check=False,
+        )
+    if not is_nss_ca_trusted(nss_db):
+        trust_nss_ca(ca_cert_path, nss_db)
+
+
 def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_path: Path) -> None:
     """Launch the browser configured to use the forward proxy."""
     import subprocess
@@ -1340,20 +1380,10 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
 
     if kind in ("chrome", "chromium"):
         # Chromium/Chrome: dedicated temp profile so we don't pollute the real one.
-        # We install the CA into the temp profile's NSS db before launch.
         tmp_dir = Path(tempfile.mkdtemp(prefix="claude-tap-chrome-"))
-        nss_dir = tmp_dir / "Default"
-        nss_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create NSS db in the temp profile
-        certutil = shutil.which("certutil")
-        if certutil:
-            subprocess.run(
-                [certutil, "-N", "-d", f"sql:{nss_dir}", "--empty-password"],
-                capture_output=True,
-                check=False,
-            )
-            trust_nss_ca(ca_cert_path, nss_dir)
+        # Old Chrome (<117): trust in the user's shared NSS db (~/.pki/nssdb)
+        _ensure_user_chrome_nss_trust(ca_cert_path)
 
         args_list = [
             exe,
@@ -1363,6 +1393,12 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
             "--no-default-browser-check",
             "--disable-sync",
         ]
+
+        # Chrome 117+ dropped NSS for TLS; pass SPKI hash so only our CA is trusted
+        spki = _compute_spki_hash_b64(ca_cert_path)
+        if spki:
+            args_list.append(f"--ignore-certificate-errors-spki-list={spki}")
+
         _print(f"Launching {kind} -> {exe}")
         _print(f"  proxy: http://{proxy_addr}")
         _print(f"  temp profile: {tmp_dir}")
