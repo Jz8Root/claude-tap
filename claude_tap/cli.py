@@ -1385,9 +1385,19 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
         # Old Chrome (<117): trust in the user's shared NSS db (~/.pki/nssdb)
         _ensure_user_chrome_nss_trust(ca_cert_path)
 
+        # Chrome has hardcoded cert pins for Google domains that cannot be overridden
+        # by --ignore-certificate-errors-spki-list. Bypass the proxy for those so
+        # Chrome's background services (GCM, sync) work normally.
+        _CHROME_PROXY_BYPASS = (
+            "localhost;127.0.0.1;"
+            "*.google.com;*.googleapis.com;*.gstatic.com;"
+            "*.googlevideo.com;*.googleusercontent.com;*.youtube.com"
+        )
+
         args_list = [
             exe,
             f"--proxy-server=http://{proxy_addr}",
+            f"--proxy-bypass-list={_CHROME_PROXY_BYPASS}",
             f"--user-data-dir={tmp_dir}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -1398,6 +1408,7 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
         spki = _compute_spki_hash_b64(ca_cert_path)
         if spki:
             args_list.append(f"--ignore-certificate-errors-spki-list={spki}")
+            _print(f"  SPKI bypass: {spki[:16]}…")
 
         _print(f"Launching {kind} -> {exe}")
         _print(f"  proxy: http://{proxy_addr}")
@@ -1543,7 +1554,7 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
     return 0
 
 
-def browser_main(argv: list[str] | None = None) -> int:
+def browser_main(argv: list[str] | None = -> int:
     """Entry point for the browser subcommand."""
     args = parse_browser_args(argv)
     try:
