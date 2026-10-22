@@ -623,13 +623,19 @@ class ForwardProxyServer:
         # Request identity encoding from upstream to avoid client-side zstd decode issues
         # and to simplify SSE/text reconstruction.
         fwd_headers["Accept-Encoding"] = "identity"
+        # For bodyless methods (GET/HEAD/DELETE/…), strip any Content-Length that may
+        # have slipped through — aiohttp would add Content-Length: 0 when data=b"",
+        # which causes HTTP 500 on some upstream servers (Cloudflare, nginx strict mode).
+        if not body:
+            fwd_headers.pop("Content-Length", None)
+            fwd_headers.pop("content-length", None)
 
         try:
             upstream_resp = await self._session.request(
                 method=method,
                 url=upstream_url,
                 headers=fwd_headers,
-                data=body,
+                data=body or None,
                 timeout=aiohttp.ClientTimeout(total=600, sock_read=300),
             )
         except Exception as exc:
@@ -878,34 +884,30 @@ class ForwardProxyServer:
         upstream_resp: aiohttp.ClientResponse,
         client_writer: asyncio.StreamWriter,
     ) -> int:
+        # Always use chunked transfer encoding.  aiohttp auto-decompresses responses
+        # (Content-Encoding: gzip/br/zstd) but keeps the *compressed* Content-Length
+        # in the response headers.  Re-using that value would give Chrome a wrong
+        # Content-Length and break the tunnel.  Chunked avoids the mismatch entirely.
         total_bytes = 0
         try:
             status_line = f"HTTP/1.1 {upstream_resp.status} {upstream_resp.reason}\r\n"
             client_writer.write(status_line.encode())
-            skip_headers = HOP_BY_HOP | {"content-length"}
-            content_length = _header_value(upstream_resp.headers, "Content-Length")
+            # Skip content-length (we'll use chunked) and content-encoding (aiohttp
+            # already decoded it, so the header no longer reflects the actual bytes).
+            skip_headers = HOP_BY_HOP | {"content-length", "content-encoding"}
             for key, value in upstream_resp.headers.items():
                 if key.lower() not in skip_headers:
                     client_writer.write(f"{key}: {value}\r\n".encode())
-            if content_length:
-                client_writer.write(f"Content-Length: {content_length}\r\n".encode())
-                chunked = False
-            else:
-                client_writer.write(b"Transfer-Encoding: chunked\r\n")
-                chunked = True
+            client_writer.write(b"Transfer-Encoding: chunked\r\n")
             client_writer.write(b"\r\n")
             await client_writer.drain()
 
             async for chunk in upstream_resp.content.iter_chunked(65536):
                 total_bytes += len(chunk)
-                if chunked:
-                    client_writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-                else:
-                    client_writer.write(chunk)
+                client_writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                 await client_writer.drain()
-            if chunked:
-                client_writer.write(b"0\r\n\r\n")
-                await client_writer.drain()
+            client_writer.write(b"0\r\n\r\n")
+            await client_writer.drain()
             return total_bytes
         finally:
             upstream_resp.close()
