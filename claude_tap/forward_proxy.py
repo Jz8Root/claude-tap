@@ -119,8 +119,9 @@ def _upstream_base_url(upstream_url: str, request_path: str) -> str | None:
 def _matches_path_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
     clean = path.split("?", 1)[0].rstrip("/")
     return any(
-        clean == prefix or clean.startswith(prefix + "/") or clean.startswith(prefix + ":")
+        clean == p or clean.startswith(p + "/") or clean.startswith(p + ":")
         for prefix in prefixes
+        for p in (prefix.rstrip("/"),)
     )
 
 
