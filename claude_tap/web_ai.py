@@ -3,6 +3,7 @@
 Normalizes request bodies from web-based AI chat interfaces (claude.ai, chatgpt.com)
 into formats the trace viewer can parse -- standard Anthropic/OpenAI message arrays.
 """
+
 from __future__ import annotations
 
 import re
@@ -94,9 +95,7 @@ def _normalize_chatgpt_message(msg: object) -> dict | None:
     if not isinstance(msg, dict):
         return None
     author = msg.get("author")
-    role: str | None = msg.get("role") or (
-        author.get("role") if isinstance(author, dict) else None
-    )
+    role: str | None = msg.get("role") or (author.get("role") if isinstance(author, dict) else None)
     if not isinstance(role, str) or not role:
         return None
 

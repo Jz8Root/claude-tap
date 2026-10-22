@@ -180,13 +180,14 @@ def trust_macos_ca(ca_cert_path: Path, keychain_path: Path | None = None) -> sub
 # Linux system CA trust
 # ---------------------------------------------------------------------------
 
+
 def _linux_ca_bundle_dirs() -> list[Path]:
     """Return candidate system CA extra-certs directories, most-specific first."""
     return [
-        Path("/usr/local/share/ca-certificates"),   # Debian/Ubuntu
-        Path("/etc/pki/ca-trust/source/anchors"),    # Fedora/RHEL/CentOS
+        Path("/usr/local/share/ca-certificates"),  # Debian/Ubuntu
+        Path("/etc/pki/ca-trust/source/anchors"),  # Fedora/RHEL/CentOS
         Path("/etc/ca-certificates/trust-source/anchors"),  # Arch
-        Path("/usr/share/pki/trust/anchors"),        # openSUSE
+        Path("/usr/share/pki/trust/anchors"),  # openSUSE
     ]
 
 
@@ -252,6 +253,7 @@ def trust_linux_ca(ca_cert_path: Path) -> tuple[bool, str]:
 # Firefox NSS trust (certutil)
 # ---------------------------------------------------------------------------
 
+
 def _firefox_nss_profile_dirs() -> list[Path]:
     """Return existing Firefox NSS profile directories for the current user."""
     candidates: list[Path] = []
@@ -283,9 +285,9 @@ def _chrome_nss_profile_dirs() -> list[Path]:
     candidates: list[Path] = []
     home = Path.home()
     bases = [
-        home / ".pki" / "nssdb",               # Chromium shared NSS on Linux
-        home / ".config" / "google-chrome",     # Chrome
-        home / ".config" / "chromium",          # Chromium
+        home / ".pki" / "nssdb",  # Chromium shared NSS on Linux
+        home / ".config" / "google-chrome",  # Chrome
+        home / ".config" / "chromium",  # Chromium
         home / "snap" / "chromium" / "current" / ".pki" / "nssdb",
     ]
     for b in bases:
@@ -355,6 +357,7 @@ def trust_chrome_nss_ca(ca_cert_path: Path) -> list[tuple[bool, str]]:
 
 
 # ---------------------------------------------------------------------------
+
 
 def _load_ca(ca_cert_path: Path, ca_key_path: Path) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
     """Load CA cert and key from PEM files."""
@@ -438,7 +441,6 @@ class CertificateAuthority:
 
     def make_ssl_context(self, hostname: str) -> ssl.SSLContext:
         """Create an SSL context for serving TLS as the given hostname."""
-        import tempfile
 
         cert_pem, key_pem = self.get_host_cert_pem(hostname)
 

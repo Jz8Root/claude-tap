@@ -113,8 +113,8 @@ def test_trust_macos_ca_runs_add_trusted_cert(monkeypatch: pytest.MonkeyPatch) -
     assert calls[0][-1] == str(ca_path)
 
 
-def test_trust_ca_for_current_user_rejects_non_macos(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("claude_tap.cli.sys.platform", "linux")
+def test_trust_ca_for_current_user_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("claude_tap.cli.sys.platform", "win32")
 
     code = _trust_ca_for_current_user(Path("/tmp/claude-tap-ca.pem"))
 
@@ -187,13 +187,16 @@ def test_trust_ca_for_current_user_installs_and_rechecks(monkeypatch: pytest.Mon
 def test_trust_ca_main_uses_generated_ca(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     ca_path = tmp_path / "ca.pem"
     key_path = tmp_path / "ca-key.pem"
-    trusted: list[Path] = []
+    trusted: list[tuple[Path, dict[str, bool]]] = []
 
     monkeypatch.setattr("claude_tap.cli.ensure_ca", lambda: (ca_path, key_path))
-    monkeypatch.setattr("claude_tap.cli._trust_ca_for_current_user", lambda path: trusted.append(path) or 0)
+    monkeypatch.setattr(
+        "claude_tap.cli._trust_ca_for_current_user",
+        lambda path, **kwargs: trusted.append((path, kwargs)) or 0,
+    )
 
     assert trust_ca_main([]) == 0
-    assert trusted == [ca_path]
+    assert trusted == [(ca_path, {"firefox": False, "chrome": False})]
 
 
 def test_auto_ca_trust_skips_non_agy_clients(monkeypatch: pytest.MonkeyPatch) -> None:
