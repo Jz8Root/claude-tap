@@ -1478,6 +1478,11 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
+    log.addHandler(console)
+    log.setLevel(logging.DEBUG if os.environ.get("CLAUDE_TAP_DEBUG") else logging.INFO)
+
     store = get_trace_store()
     writer = _create_trace_writer(store=store, client="browser", proxy_mode="forward", metadata={})
 
