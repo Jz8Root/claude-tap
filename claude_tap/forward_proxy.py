@@ -42,7 +42,6 @@ except ImportError:
 
 from claude_tap.bedrock import attach_bedrock_errors, is_bedrock_eventstream_path
 from claude_tap.certs import CertificateAuthority
-from claude_tap.web_ai import is_web_ai_host, normalize_web_ai_request
 from claude_tap.proxy import (
     HOP_BY_HOP,
     _build_record,
@@ -56,9 +55,11 @@ from claude_tap.proxy import (
 )
 from claude_tap.sse import SSEReassembler
 from claude_tap.trace import TraceWriter
+from claude_tap.trace_encoding import is_encoded_blob_body
 from claude_tap.upstream import build_upstream_url, format_upstream_error
 from claude_tap.usage import normalize_usage
 from claude_tap.viewer import _decode_bedrock_eventstream_events
+from claude_tap.web_ai import is_web_ai_host, normalize_web_ai_request
 from claude_tap.ws_proxy import (
     _COMPLETED_RESPONSE_KEY_CACHE_SIZE,
     _build_ws_record,
@@ -98,6 +99,14 @@ DEFAULT_TRACE_IGNORED_PACKAGE_METADATA_CONTENT_TYPES = frozenset(
     }
 )
 PACKAGE_MANAGER_USER_AGENT_MARKERS = ("npm/", "yarn/", "pnpm/", "bun/")
+STREAMING_CONTENT_TYPE_PREFIXES = (
+    "text/event-stream",
+    "application/connect+",
+    "application/grpc-web",
+    "application/x-ndjson",
+)
+MAX_RAW_STREAM_CAPTURE_BYTES = 2 * 1024 * 1024
+MAX_RAW_REQUEST_CAPTURE_BYTES = 256 * 1024
 
 
 def _upstream_base_url(upstream_url: str, request_path: str) -> str | None:
@@ -138,6 +147,32 @@ def _header_value(headers: Mapping[str, str], name: str) -> str:
         if key.lower() == lower_name:
             return value
     return ""
+
+
+def _is_streaming_response(headers: Mapping[str, str]) -> bool:
+    """Return whether the Content-Type marks a body that must be relayed incrementally."""
+    media_type = _header_value(headers, "Content-Type").split(";", 1)[0].strip().lower()
+    return media_type.startswith(STREAMING_CONTENT_TYPE_PREFIXES)
+
+
+def _is_unbounded_response(headers: Mapping[str, str]) -> bool:
+    """Return whether the body is chunked without a length, so its end is not known up front."""
+    is_chunked = "chunked" in _header_value(headers, "Transfer-Encoding").lower()
+    return is_chunked and not _header_value(headers, "Content-Length")
+
+
+def _decode_raw_stream_body(raw: bytes) -> object:
+    """Decode a non-SSE streamed body for trace storage without losing binary payloads."""
+    if not raw:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"_encoding": "binary", "byte_length": len(raw), "base64": base64.b64encode(raw).decode("ascii")}
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 def _decode_request_body_for_trace(body: bytes, headers: Mapping[str, str]) -> bytes:
@@ -577,12 +612,21 @@ class ForwardProxyServer:
         _upstream_hostname = urlparse(upstream_url).hostname or ""
         if is_web_ai_host(_upstream_hostname):
             req_body = normalize_web_ai_request(_upstream_hostname, path, req_body)
+            # Protobuf bodies are stored as a size-only placeholder; keep the bytes so the
+            # call can still be decoded offline.
+            if should_trace and is_encoded_blob_body(req_body):
+                raw_request = trace_body[:MAX_RAW_REQUEST_CAPTURE_BYTES]
+                req_body = {**req_body, "base64": base64.b64encode(raw_request).decode("ascii")}
 
         is_streaming = is_capture_only_streaming_request(path, req_body)
 
         model = req_body.get("model", "") if isinstance(req_body, dict) else ""
         if should_trace:
-            log.info(f"{log_prefix} -> {method} {path} (model={model}, stream={is_streaming})")
+            req_media_type = _header_value(headers, "Content-Type").split(";", 1)[0].strip() or "-"
+            log.info(
+                f"{log_prefix} -> {method} {path} "
+                f"(model={model}, stream={is_streaming}, ct={req_media_type}, {len(body)} bytes)"
+            )
         else:
             log.debug(f"{log_prefix} -> {method} {path} (trace skipped by client filter)")
 
@@ -672,12 +716,15 @@ class ForwardProxyServer:
             log.debug(f"{log_prefix} <- {upstream_resp.status} ({duration_ms}ms, {total_bytes} bytes, trace skipped)")
             return
 
-        # Re-detect streaming from the actual response Content-Type.
+        # Re-detect streaming from the actual response.
         # Web AI interfaces (claude.ai, chatgpt.com) don't always set "stream": true
-        # in the request body, so path/body heuristics alone aren't enough.
+        # in the request body, so path/body heuristics alone aren't enough. Buffering a
+        # live stream would stall the page, so on those hosts any chunked response of
+        # unknown length is relayed incrementally as well.
         if not is_streaming and upstream_resp.status == 200:
-            resp_ct = _header_value(dict(upstream_resp.headers), "Content-Type").lower()
-            if "text/event-stream" in resp_ct:
+            if _is_streaming_response(upstream_resp.headers) or (
+                is_web_ai_host(_upstream_hostname) and _is_unbounded_response(upstream_resp.headers)
+            ):
                 is_streaming = True
 
         assert turn is not None
@@ -730,17 +777,23 @@ class ForwardProxyServer:
         status_line = f"HTTP/1.1 {upstream_resp.status} {upstream_resp.reason}\r\n"
         client_writer.write(status_line.encode())
 
-        # Send response headers (filter hop-by-hop, use chunked transfer)
+        # Send response headers (filter hop-by-hop, use chunked transfer). aiohttp has
+        # already decoded the body, so Content-Length/Content-Encoding no longer describe it.
+        skip_headers = HOP_BY_HOP | {"content-length", "content-encoding"}
         for key, value in upstream_resp.headers.items():
-            if key.lower() not in HOP_BY_HOP:
+            if key.lower() not in skip_headers:
                 client_writer.write(f"{key}: {value}\r\n".encode())
         client_writer.write(b"Transfer-Encoding: chunked\r\n")
         client_writer.write(b"\r\n")
         await client_writer.drain()
 
         is_bedrock_stream = is_bedrock_eventstream_path(path)
+        resp_media_type = _header_value(upstream_resp.headers, "Content-Type").split(";", 1)[0].strip().lower()
+        is_sse = resp_media_type == "text/event-stream"
         reassembler = SSEReassembler(store_events=self._store_stream_events)
         raw_chunks: list[bytes] = []
+        raw_size = 0
+        raw_truncated = False
 
         try:
             async for chunk in upstream_resp.content.iter_any():
@@ -750,8 +803,14 @@ class ForwardProxyServer:
                 await client_writer.drain()
                 if is_bedrock_stream:
                     raw_chunks.append(chunk)
-                else:
-                    reassembler.feed_bytes(chunk)
+                    continue
+                reassembler.feed_bytes(chunk)
+                if not is_sse:
+                    if raw_size < MAX_RAW_STREAM_CAPTURE_BYTES:
+                        raw_chunks.append(chunk)
+                        raw_size += len(chunk)
+                    else:
+                        raw_truncated = True
         except (ConnectionError, asyncio.CancelledError):
             pass
 
@@ -775,16 +834,21 @@ class ForwardProxyServer:
             reconstructed = attach_bedrock_errors(reconstructed, bedrock_events)
         else:
             reconstructed = reassembler.reconstruct()
+            if reconstructed is None and not is_sse:
+                reconstructed = _decode_raw_stream_body(b"".join(raw_chunks))
 
         usage = normalize_usage(reconstructed.get("usage", {}) if isinstance(reconstructed, dict) else {})
         in_tok = usage.get("input_tokens", 0)
         out_tok = usage.get("output_tokens", 0)
         cache_read = usage.get("cache_read_input_tokens", 0)
         cache_create = usage.get("cache_creation_input_tokens", 0)
+        raw_info = "" if is_sse or is_bedrock_stream else f", ct={resp_media_type or '-'}, {raw_size} bytes"
         log.info(
             f"{log_prefix} <- 200 stream done ({duration_ms}ms, in={in_tok} out={out_tok}"
-            f" cache_read={cache_read} cache_create={cache_create})"
+            f" cache_read={cache_read} cache_create={cache_create}{raw_info})"
         )
+        if raw_truncated:
+            log.warning(f"{log_prefix} stream capture truncated at {MAX_RAW_STREAM_CAPTURE_BYTES} bytes")
 
         record = _build_record(
             req_id,

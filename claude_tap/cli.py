@@ -37,8 +37,6 @@ from claude_tap.certs import (
     trust_linux_ca,
     trust_macos_ca,
     trust_nss_ca,
-    _firefox_nss_profile_dirs,
-    _chrome_nss_profile_dirs,
 )
 from claude_tap.cli_clients import (
     _CODEX_CHATGPT_TARGET,
@@ -1336,9 +1334,11 @@ def _find_browser_executable(browser: str | None) -> tuple[str, str] | None:
 def _compute_spki_hash_b64(ca_cert_path: Path) -> str | None:
     """Return base64-SHA-256 of the CA public key (SPKI) for Chrome's cert pinning flag."""
     import base64
+
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
+
         cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
         pub_key_der = cert.public_key().public_bytes(
             serialization.Encoding.DER,
@@ -1358,6 +1358,7 @@ def _ensure_user_chrome_nss_trust(ca_cert_path: Path) -> None:
     Chrome 117+ ignores NSS entirely; the SPKI-list flag covers those versions.
     """
     import subprocess
+
     nss_db = Path.home() / ".pki" / "nssdb"
     certutil = shutil.which("certutil")
     if certutil is None:
@@ -1462,6 +1463,27 @@ def _launch_browser_with_proxy(kind: str, exe: str, proxy_addr: str, ca_cert_pat
     subprocess.Popen(args_list)  # noqa: S603 -- intentional, user-controlled browser path
 
 
+# Browser mode: only trace POST requests to known AI API paths.
+# Filters out page loads, images, fonts, analytics, etc.
+BROWSER_TRACE_METHODS = ("POST",)
+BROWSER_TRACE_PATH_PREFIXES = (
+    # claude.ai legacy conversation completions
+    "/api/organizations/",
+    # claude.ai Connect-RPC conversation API: message send and response timeline stream
+    "/claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/PerformAction",
+    "/claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/StreamTimeline",
+    # chatgpt.com backend conversation
+    "/backend-api/conversation",
+    # Direct API clients that may also be open in the browser
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/v1beta/models/",
+    "/v1alpha/models/",
+)
+
+
 async def _browser_proxy_main(args: argparse.Namespace) -> int:
     """Run the forward proxy for the browser subcommand."""
     from claude_tap.trace_store import get_trace_store
@@ -1494,22 +1516,8 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
             writer=writer,
             session=session,
             store_stream_events=False,
-            # Browser mode: only trace POST requests to known AI API paths.
-            # Filters out page loads, images, fonts, analytics, etc.
-            trace_methods=("POST",),
-            trace_path_prefixes=(
-                # claude.ai conversation completions
-                "/api/organizations/",
-                # chatgpt.com backend conversation
-                "/backend-api/conversation",
-                # Direct API clients that may also be open in the browser
-                "/v1/messages",
-                "/v1/chat/completions",
-                "/v1/completions",
-                "/v1/responses",
-                "/v1beta/models/",
-                "/v1alpha/models/",
-            ),
+            trace_methods=BROWSER_TRACE_METHODS,
+            trace_path_prefixes=BROWSER_TRACE_PATH_PREFIXES,
         )
         actual_port = await proxy.start()
         proxy_addr = f"{args.host}:{actual_port}"
@@ -1544,7 +1552,7 @@ async def _browser_proxy_main(args: argparse.Namespace) -> int:
             kind, exe = found
             _launch_browser_with_proxy(kind, exe, proxy_addr, ca_cert_path)
         else:
-            _print(f"\nProxy-only mode -- configure your browser:")
+            _print("\nProxy-only mode -- configure your browser:")
             _print(f"  HTTP proxy:  http://{proxy_addr}")
             _print(f"  CA cert:     {ca_cert_path}")
 
